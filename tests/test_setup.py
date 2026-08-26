@@ -2,7 +2,7 @@ import pytest
 from concurrent.futures import ThreadPoolExecutor
 
 from packtogether.bot import setup_input
-from packtogether.calendar import format_departure, jalali_to_utc, parse_jalali_date, parse_time, validate_departure_date
+from packtogether.date_utils import format_departure, jalali_to_utc, parse_jalali_date, parse_time, validate_departure_date
 from packtogether.db import Database
 from packtogether.service import TripService
 

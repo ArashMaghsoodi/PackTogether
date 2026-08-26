@@ -1,6 +1,17 @@
 from __future__ import annotations
 
-from .calendar import format_departure as format_shamsi_departure
+try:
+    from .date_utils import format_departure as format_shamsi_departure
+except ImportError:
+    from packtogether.date_utils import format_departure as format_shamsi_departure
+
+ACTIVITY_LABELS = {
+    "item_added": "آیتم «{item}» را اضافه کرد.",
+    "item_checked": "آیتم «{item}» را تیک زد.",
+    "item_unchecked": "تیک آیتم «{item}» را برداشت.",
+    "item_deleted": "آیتم «{item}» را حذف کرد.",
+    "trip_locked": "سفر را شروع کرد و چک‌لیست را قفل کرد.",
+}
 
 from .service import PAGE_SIZE
 
@@ -8,6 +19,14 @@ _DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 def fa_number(value: int | str) -> str:
     return str(value).translate(_DIGITS)
+
+
+def render_activity_line(trip_name: str, activity) -> str:
+    actor = activity["actor_name"] or "کاربر"
+    if activity["action"] == "trip_created":
+        return f"{actor} سفر «{trip_name}» را ساخت."
+    sentence = ACTIVITY_LABELS.get(activity["action"], "تغییری ثبت کرد.").format(item=activity["item_name"] or "نامشخص")
+    return f"{trip_name}: {actor} {sentence}"
 
 def render_checklist(trip, items, page: int, pages: int, packed: int, total: int) -> tuple[str, list[list[tuple[str, str]]]]:
     percent = int(packed * 16 / total) if total else 0

@@ -7,10 +7,16 @@ from dotenv import load_dotenv
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from .calendar import TEHRAN, jalali_to_utc, validate_departure_date
-from .db import Database
-from .service import Locked, NotFound, TripError, TripService
-from .ui import render_checklist
+try:
+    from .date_utils import TEHRAN, jalali_to_utc, validate_departure_date
+    from .db import Database
+    from .service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
+    from .ui import render_activity_line, render_checklist
+except ImportError:
+    from packtogether.date_utils import TEHRAN, jalali_to_utc, validate_departure_date
+    from packtogether.db import Database
+    from packtogether.service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
+    from packtogether.ui import render_activity_line, render_checklist
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -65,7 +71,7 @@ async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
         await update.effective_message.reply_text("❌ ساخت سفر لغو شد.")
 
-def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now=None) -> tuple[str, int | None]:
+def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now=None, actor_display_name: str = "هم‌گروهی") -> tuple[str, int | None]:
     setup = service.setup(chat_id, user_id)
     if not setup:
         return "", None
@@ -90,7 +96,7 @@ def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now
         raise ValueError("Current time must be timezone-aware")
     if departure <= current.astimezone(timezone.utc):
         raise ValueError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً ساعت آینده‌ای را وارد کنید.")
-    trip_id = service.complete_setup(chat_id, user_id, departure.isoformat())
+    trip_id = service.complete_setup(chat_id, user_id, departure.isoformat(), actor_display_name)
     return "✅ سفر آماده شد!", trip_id
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,7 +104,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     setup = service.setup(update.effective_chat.id, update.effective_user.id)
     if setup:
         try:
-            response, trip_id = setup_input(service, update.effective_chat.id, update.effective_user.id, update.effective_message.text)
+            response, trip_id = setup_input(service, update.effective_chat.id, update.effective_user.id, update.effective_message.text, actor_display_name=update.effective_user.first_name)
             await update.effective_message.reply_text(response, reply_markup=cancel_markup() if not trip_id else None)
             if trip_id:
                 await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
@@ -112,7 +118,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_trip = context.user_data.get("add_item")
     if add_trip:
         try:
-            service.add_item(add_trip, update.effective_message.text, update.effective_user.id)
+            service.add_item(add_trip, update.effective_message.text, update.effective_user.id, update.effective_user.first_name)
             context.user_data.pop("add_item", None); await show(update, service, service.trip_for_chat(update.effective_chat.id))
         except (TripError, NotFound) as error:
             await update.effective_message.reply_text(str(error))
@@ -150,7 +156,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif kind == "page": await query.answer(); await show(update, service, trip, int(rest[0]))
         elif kind == "confirm":
             if context.user_data.get("delete_item") != int(rest[0]): raise NotFound("درخواست حذف منقضی شده است.")
-            service.delete_item(trip["id"], int(rest[0]), update.effective_user.id)
+            service.delete_item(trip["id"], int(rest[0]), update.effective_user.id, update.effective_user.first_name)
             context.user_data.pop("delete_item", None); context.user_data.pop("manage_trip", None)
             await query.answer()
             await query.message.delete()
@@ -161,8 +167,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("حذف لغو شد.")
         elif kind == "activity":
             lines = ["📋 فعالیت‌های اخیر", ""]
-            labels = {"trip_created": "سفر را ساخت.", "item_added": "مورد را اضافه کرد.", "item_claimed": "مورد را برداشت.", "item_unclaimed": "مورد را از لیست خود برداشت.", "item_deleted": "مورد را حذف کرد.", "trip_locked": "سفر شروع شد و چک‌لیست قفل شد."}
-            for row in service.activities(trip["id"]): lines.append(f"{row['item_name'] or 'سفر'}: {labels.get(row['action'], 'تغییری ثبت شد.')}")
+            lines.extend(render_activity_line(trip["name"], row) for row in service.activities(trip["id"]))
             await query.answer(); await query.message.reply_text("\n".join(lines))
         elif kind == "manage":
             items, page, pages = service.page(trip["id"])

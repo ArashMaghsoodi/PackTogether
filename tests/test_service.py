@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from packtogether.db import Database
 from packtogether.service import Locked, TripService
+from packtogether.ui import render_activity_line
 
 
 def service():
@@ -54,3 +55,18 @@ def test_concurrent_claims_preserve_both_users():
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda user: s.toggle_contribution(t, item, user, f"کاربر {user}"), (1, 2)))
     assert db.connection.execute("SELECT COUNT(*) FROM contributions WHERE item_id=?", (item,)).fetchone()[0] == 2
+
+
+def test_activity_records_actor_and_item_snapshots():
+    s = service(); t = s.create_trip(-101, "سفر شمال", (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(), "Asia/Tehran", 1, "آرش")
+    item = s.add_item(t, "قلیان", 2, "حسین")
+    s.toggle_contribution(t, item, 3, "علی", "علی")
+    s.toggle_contribution(t, item, 3, "علی", "علی")
+    s.delete_item(t, item, 4, "رضا")
+    events = s.activities(t)
+    assert [(event["action"], event["actor_name"], event["item_name"]) for event in events[:4]] == [("item_deleted", "رضا", "قلیان"), ("item_unchecked", "علی", "قلیان"), ("item_checked", "علی", "قلیان"), ("item_added", "حسین", "قلیان")]
+    assert events[-1]["actor_name"] == "آرش"
+    lines = [render_activity_line("سفر شمال", event) for event in events]
+    assert "سفر شمال: رضا آیتم «قلیان» را حذف کرد." in lines
+    assert "آرش سفر «سفر شمال» را ساخت." in lines
+    assert all("مورد را" not in line for line in lines)

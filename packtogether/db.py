@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS trips (
     status TEXT NOT NULL DEFAULT 'packing' CHECK(status IN ('packing', 'locked')),
     message_id INTEGER,
     created_by INTEGER NOT NULL,
+    creator_name TEXT NOT NULL DEFAULT 'کاربر',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS items (
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS activities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     trip_id INTEGER NOT NULL REFERENCES trips(id),
     user_id INTEGER NOT NULL,
+    actor_name TEXT,
     action TEXT NOT NULL,
     item_id INTEGER REFERENCES items(id),
     item_name TEXT,
@@ -74,7 +76,16 @@ class Database:
         self.connection.execute("PRAGMA busy_timeout=30000")
         self.connection.executescript(SCHEMA)
         self._migrate_trip_constraint()
+        self._migrate_activity_actor()
         self.connection.commit()
+
+    def _migrate_activity_actor(self) -> None:
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(activities)")}
+        if "actor_name" not in columns:
+            self.connection.execute("ALTER TABLE activities ADD COLUMN actor_name TEXT")
+        trip_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(trips)")}
+        if "creator_name" not in trip_columns:
+            self.connection.execute("ALTER TABLE trips ADD COLUMN creator_name TEXT NOT NULL DEFAULT 'کاربر'")
 
     def _migrate_trip_constraint(self) -> None:
         table_sql = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='trips'").fetchone()[0]

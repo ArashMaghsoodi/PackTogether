@@ -18,6 +18,13 @@ class NotFound(TripError):
 class Locked(TripError):
     pass
 
+TRIP_CREATED = "trip_created"
+ITEM_ADDED = "item_added"
+ITEM_CHECKED = "item_checked"
+ITEM_UNCHECKED = "item_unchecked"
+ITEM_DELETED = "item_deleted"
+TRIP_LOCKED = "trip_locked"
+
 @dataclass(frozen=True)
 class Change:
     item_id: int
@@ -28,7 +35,7 @@ class TripService:
     def __init__(self, db: Database):
         self.db = db
 
-    def create_trip(self, chat_id: int, name: str, departure_at: str, timezone_name: str, user_id: int) -> int:
+    def create_trip(self, chat_id: int, name: str, departure_at: str, timezone_name: str, user_id: int, actor_display_name: str = "کاربر") -> int:
         if chat_id >= 0:
             raise TripError("سفر فقط در گروه قابل ساخت است.")
         name = name.strip()
@@ -47,13 +54,13 @@ class TripService:
                 raise TripError("این گروه از قبل یک سفر فعال دارد.")
             try:
                 cursor = cx.execute(
-                    "INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,created_at) VALUES(?,?,?,?,?,?)",
-                    (chat_id, name, departure_at, timezone_name, user_id, now_iso()),
+                    "INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,creator_name,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (chat_id, name, departure_at, timezone_name, user_id, actor_display_name, now_iso()),
                 )
             except sqlite3.IntegrityError as error:
                 raise TripError("این گروه در حال حاضر یک سفر فعال دارد.") from error
             trip_id = cursor.lastrowid
-            cx.execute("INSERT INTO activities(trip_id,user_id,action,created_at) VALUES(?,?,?,?)", (trip_id, user_id, "trip_created", now_iso()))
+            self._record_activity(cx, trip_id, user_id, TRIP_CREATED, actor_display_name)
             return int(trip_id)
 
     def _reconcile_chat(self, cx, chat_id: int) -> None:
@@ -78,7 +85,7 @@ class TripService:
     def _lock_if_due(self, cx, trip) -> bool:
         if trip["status"] == "packing" and datetime.fromisoformat(trip["departure_at"]) <= datetime.now(timezone.utc):
             cx.execute("UPDATE trips SET status='locked' WHERE id=? AND status='packing'", (trip["id"],))
-            cx.execute("INSERT INTO activities(trip_id,user_id,action,created_at) VALUES(?,?,?,?)", (trip["id"], trip["created_by"], "trip_locked", now_iso()))
+            self._record_activity(cx, trip["id"], trip["created_by"], TRIP_LOCKED, trip["creator_name"] or "کاربر")
             return True
         return False
 
@@ -112,7 +119,7 @@ class TripService:
         with self.db.transaction() as cx:
             return cx.execute("DELETE FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)).rowcount == 1
 
-    def complete_setup(self, chat_id: int, user_id: int, departure_at: str) -> int:
+    def complete_setup(self, chat_id: int, user_id: int, departure_at: str, actor_display_name: str = "کاربر") -> int:
         with self.db.transaction() as cx:
             setup = cx.execute("SELECT * FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
             if not setup or not setup["trip_name"]:
@@ -128,14 +135,14 @@ class TripService:
             if existing:
                 raise TripError("این گروه از قبل یک سفر فعال دارد.")
             try:
-                trip_id = cx.execute("INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,created_at) VALUES(?,?,?,?,?,?)", (chat_id, setup["trip_name"], departure_at, "Asia/Tehran", user_id, now_iso())).lastrowid
+                trip_id = cx.execute("INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,creator_name,created_at) VALUES(?,?,?,?,?,?,?)", (chat_id, setup["trip_name"], departure_at, "Asia/Tehran", user_id, actor_display_name, now_iso())).lastrowid
             except sqlite3.IntegrityError as error:
                 raise TripError("این گروه در حال حاضر یک سفر فعال دارد.") from error
-            cx.execute("INSERT INTO activities(trip_id,user_id,action,created_at) VALUES(?,?,?,?)", (trip_id, user_id, "trip_created", now_iso()))
+            self._record_activity(cx, trip_id, user_id, TRIP_CREATED, actor_display_name)
             cx.execute("DELETE FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id))
             return int(trip_id)
 
-    def add_item(self, trip_id: int, name: str, user_id: int) -> int:
+    def add_item(self, trip_id: int, name: str, user_id: int, actor_display_name: str = "کاربر") -> int:
         name = name.strip()
         with self.db.transaction() as cx:
             trip = cx.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
@@ -143,10 +150,10 @@ class TripService:
             if self._lock_if_due(cx, trip) or trip["status"] == "locked": raise Locked()
             position = cx.execute("SELECT COALESCE(MAX(position), -1)+1 FROM items WHERE trip_id=?", (trip_id,)).fetchone()[0]
             item_id = cx.execute("INSERT INTO items(trip_id,name,position,created_by,created_at) VALUES(?,?,?,?,?)", (trip_id, name, position, user_id, now_iso())).lastrowid
-            cx.execute("INSERT INTO activities(trip_id,user_id,action,item_id,item_name,created_at) VALUES(?,?,?,?,?,?)", (trip_id,user_id,"item_added",item_id,name,now_iso()))
+            self._record_activity(cx, trip_id, user_id, ITEM_ADDED, actor_display_name, item_id, name)
             return int(item_id)
 
-    def toggle_contribution(self, trip_id: int, item_id: int, user_id: int, display_name: str) -> Change:
+    def toggle_contribution(self, trip_id: int, item_id: int, user_id: int, display_name: str, actor_display_name: str | None = None) -> Change:
         with self.db.transaction() as cx:
             trip = cx.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
             if not trip: raise NotFound("سفر پیدا نشد.")
@@ -156,19 +163,19 @@ class TripService:
             existing = cx.execute("SELECT 1 FROM contributions WHERE item_id=? AND user_id=?", (item_id,user_id)).fetchone()
             if existing:
                 cx.execute("DELETE FROM contributions WHERE item_id=? AND user_id=?", (item_id,user_id))
-                action = "item_unclaimed"
+                action = ITEM_UNCHECKED
                 duplicate_names = ()
                 claimed = False
             else:
                 others = tuple(row[0] for row in cx.execute("SELECT display_name FROM contributions WHERE item_id=?", (item_id,)))
                 cx.execute("INSERT INTO contributions VALUES(?,?,?,?)", (item_id,user_id,display_name.strip() or "هم‌گروهی",now_iso()))
-                action = "item_claimed"
+                action = ITEM_CHECKED
                 duplicate_names = others
                 claimed = True
-            cx.execute("INSERT INTO activities(trip_id,user_id,action,item_id,item_name,created_at) VALUES(?,?,?,?,?,?)", (trip_id,user_id,action,item_id,item["name"],now_iso()))
+            self._record_activity(cx, trip_id, user_id, action, actor_display_name or display_name, item_id, item["name"])
             return Change(item_id, claimed, duplicate_names)
 
-    def delete_item(self, trip_id: int, item_id: int, user_id: int) -> None:
+    def delete_item(self, trip_id: int, item_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
         with self.db.transaction() as cx:
             trip = cx.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
             if not trip: raise NotFound("سفر پیدا نشد.")
@@ -176,7 +183,11 @@ class TripService:
             item = cx.execute("SELECT * FROM items WHERE id=? AND trip_id=? AND deleted_at IS NULL", (item_id, trip_id)).fetchone()
             if not item: raise NotFound("این مورد دیگر وجود ندارد.")
             cx.execute("UPDATE items SET deleted_at=? WHERE id=? AND deleted_at IS NULL", (now_iso(), item_id))
-            cx.execute("INSERT INTO activities(trip_id,user_id,action,item_id,item_name,created_at) VALUES(?,?,?,?,?,?)", (trip_id,user_id,"item_deleted",item_id,item["name"],now_iso()))
+            self._record_activity(cx, trip_id, user_id, ITEM_DELETED, actor_display_name, item_id, item["name"])
+
+    @staticmethod
+    def _record_activity(cx, trip_id: int, user_id: int, action: str, actor_name: str, item_id: int | None = None, item_name: str | None = None) -> None:
+        cx.execute("INSERT INTO activities(trip_id,user_id,actor_name,action,item_id,item_name,created_at) VALUES(?,?,?,?,?,?,?)", (trip_id, user_id, actor_name.strip() or "کاربر", action, item_id, item_name, now_iso()))
 
     def page(self, trip_id: int, page: int = 0) -> tuple[list[Any], int, int]:
         self.refresh_lock(trip_id)
