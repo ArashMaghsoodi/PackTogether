@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from .calendar import TEHRAN, jalali_to_utc, validate_departure_date
 from .db import Database
 from .service import Locked, NotFound, TripError, TripService
 from .ui import render_checklist
@@ -18,6 +18,12 @@ load_dotenv()
 
 def markup(rows):
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in rows])
+
+def cancel_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="setup_cancel")]])
+
+DATE_PROMPT = "📅 تاریخ حرکت را وارد کنید.\n\nمثال:\n1405.06.17"
+TIME_PROMPT = "🕐 ساعت حرکت را وارد کنید.\n\nمثال:\n14:30"
 
 async def show(update, service, trip, page=0, main_message=False):
     trip = service.trip_for_chat(trip["chat_id"])
@@ -39,33 +45,74 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("سلام! برای ساخت چک‌لیست سفر، نام و زمان حرکت را با /newtrip ثبت کنید.")
 
 async def new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["newtrip"] = "name"
-    await update.effective_message.reply_text("نام سفر را بفرستید.")
+    service = context.application.bot_data["service"]
+    if service.active_trip(update.effective_chat.id):
+        await update.effective_message.reply_text("⚠️ این گروه در حال حاضر یک سفر فعال دارد.\n\nلطفاً ابتدا همان سفر را به پایان برسانید یا تا زمان حرکت آن صبر کنید.")
+        return
+    if not service.begin_setup(update.effective_chat.id, update.effective_user.id):
+        await update.effective_message.reply_text("ℹ️ شما در حال ساخت یک سفر هستید. ابتدا همان سفر را کامل یا لغو کنید.")
+        return
+    await update.effective_message.reply_text("🧳 ساخت سفر جدید\n\nنام سفر را وارد کنید:", reply_markup=cancel_markup())
+
+async def private_new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("⚠️ برای ساخت سفر، دستور /newtrip را داخل گروهی که PackTogether در آن عضو است ارسال کنید.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("برای ساخت چک‌لیست، در گروه دستور /newtrip را بفرستید.")
+
+async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data["service"]
+    if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
+        await update.effective_message.reply_text("❌ ساخت سفر لغو شد.")
+
+def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now=None) -> tuple[str, int | None]:
+    setup = service.setup(chat_id, user_id)
+    if not setup:
+        return "", None
+    text = text.strip()
+    if text == "لغو":
+        service.cancel_setup(chat_id, user_id)
+        return "❌ ساخت سفر لغو شد.", None
+    if setup["state"] == "name":
+        if not text or len(text) > 80:
+            return "❌ نام سفر باید بین ۱ تا ۸۰ نویسه باشد.", None
+        service.update_setup(chat_id, user_id, "date", trip_name=text)
+        return DATE_PROMPT, None
+    if setup["state"] == "date":
+        parsed = validate_departure_date(text, now, TEHRAN)
+        normalized_date = ".".join(f"{part:02d}" if index else str(part) for index, part in enumerate(parsed))
+        service.update_setup(chat_id, user_id, "time", departure_date=normalized_date)
+        return TIME_PROMPT, None
+    departure = jalali_to_utc(setup["departure_date"], text, TEHRAN)
+    from datetime import datetime, timezone
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("Current time must be timezone-aware")
+    if departure <= current.astimezone(timezone.utc):
+        raise ValueError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً ساعت آینده‌ای را وارد کنید.")
+    trip_id = service.complete_setup(chat_id, user_id, departure.isoformat())
+    return "✅ سفر آماده شد!", trip_id
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("newtrip")
-    if state == "name":
-        context.user_data["trip_name"] = update.effective_message.text.strip(); context.user_data["newtrip"] = "departure"
-        await update.effective_message.reply_text("زمان حرکت را با منطقه زمانی بفرستید؛ مثلاً 2026-08-27T08:00:00+03:30.")
-        return
-    if state == "departure":
+    service = context.application.bot_data["service"]
+    setup = service.setup(update.effective_chat.id, update.effective_user.id)
+    if setup:
         try:
-            parsed = datetime.fromisoformat(update.effective_message.text.strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
-            if parsed.tzinfo is None:
-                raise ValueError("لطفاً منطقه زمانی را هم وارد کنید؛ مثلاً +03:30.")
-            departure = parsed.isoformat()
-            service = context.application.bot_data["service"]
-            trip_id = service.create_trip(update.effective_chat.id, context.user_data["trip_name"], departure, str(parsed.tzinfo), update.effective_user.id)
-            context.user_data.pop("newtrip", None)
-            await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
-            return
-        except (ValueError, TripError) as error:
-            await update.effective_message.reply_text(str(error) or "زمان واردشده درست نیست.")
-            return
+            response, trip_id = setup_input(service, update.effective_chat.id, update.effective_user.id, update.effective_message.text)
+            await update.effective_message.reply_text(response, reply_markup=cancel_markup() if not trip_id else None)
+            if trip_id:
+                await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
+        except (ValueError, TripError, NotFound) as error:
+            prompt = DATE_PROMPT if setup["state"] == "date" else TIME_PROMPT if setup["state"] == "time" else None
+            message = str(error)
+            if prompt:
+                message = f"{message}\n\n{prompt}"
+            await update.effective_message.reply_text(message, reply_markup=cancel_markup() if prompt else None)
+        return
     add_trip = context.user_data.get("add_item")
     if add_trip:
         try:
-            service = context.application.bot_data["service"]; service.add_item(add_trip, update.effective_message.text, update.effective_user.id)
+            service.add_item(add_trip, update.effective_message.text, update.effective_user.id)
             context.user_data.pop("add_item", None); await show(update, service, service.trip_for_chat(update.effective_chat.id))
         except (TripError, NotFound) as error:
             await update.effective_message.reply_text(str(error))
@@ -74,6 +121,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     service = context.application.bot_data["service"]
     try:
+        if query.data == "setup_cancel":
+            if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
+                await query.answer(); await query.edit_message_text("❌ ساخت سفر لغو شد.")
+            else:
+                await query.answer("این جلسه دیگر فعال نیست.", show_alert=True)
+            return
         kind, trip_id, *rest = query.data.split(":")
         trip = service.trip_for_chat(update.effective_chat.id)
         if int(trip_id) != trip["id"]: raise NotFound("این چک‌لیست متعلق به این گروه نیست.")
@@ -115,7 +168,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items, page, pages = service.page(trip["id"])
             context.user_data["manage_trip"] = trip["id"]
             rows = [[(f"{'✓' if item['contributors'] else ' '} {item['name']}", f"item:{trip['id']}:{item['id']}")] for item in items]
-            rows.append([("لغو مدیریت", f"cancel:{trip['id']}")])
+            rows.append([("لغو", f"cancel:{trip['id']}")])
             await query.answer(); await query.message.reply_text("🗑️ برای حذف، روی مورد موردنظر بزنید.", reply_markup=markup(rows))
     except Locked: await query.answer("🔒 این سفر شروع شده و چک‌لیست قفل است.", show_alert=True)
     except (TripError, ValueError) as error: await query.answer(str(error), show_alert=True)
@@ -125,12 +178,25 @@ def build_application() -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token or token == "replace-with-botfather-token":
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Set it in .env or export it before starting the bot.")
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(set_command_menus).build()
     application.bot_data["service"] = TripService(Database(os.getenv("DATABASE_PATH", "packtogether.sqlite3")))
-    application.add_handler(CommandHandler("start", start)); application.add_handler(CommandHandler("newtrip", new_trip))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("newtrip", new_trip, filters=filters.ChatType.GROUPS))
+    application.add_handler(CommandHandler("newtrip", private_new_trip, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(callback)); application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     application.job_queue.run_repeating(lock_due_trips, interval=30, first=5)
     return application
+
+async def set_command_menus(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [BotCommand("start", "نمایش چک‌لیست"), BotCommand("help", "راهنما")],
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+    await application.bot.set_my_commands(
+        [BotCommand("start", "نمایش چک‌لیست"), BotCommand("help", "راهنما"), BotCommand("newtrip", "ساخت سفر جدید")],
+        scope=BotCommandScopeAllGroupChats(),
+    )
 
 async def lock_due_trips(context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]

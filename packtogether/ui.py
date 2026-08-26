@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from .calendar import format_departure as format_shamsi_departure
 
 from .service import PAGE_SIZE
 
@@ -24,14 +24,13 @@ def render_checklist(trip, items, page: int, pages: int, packed: int, total: int
         lines += ["", f"🕐 زمان حرکت: {format_departure(trip['departure_at'], trip['timezone'])}"]
         if pages > 1:
             keyboard.append([( "◀ قبلی", f"page:{trip['id']}:{page-1}"), (f"{fa_number(page+1)} / {fa_number(pages)}", "noop"), ("بعدی ▶", f"page:{trip['id']}:{page+1}")])
-        keyboard += [[("➕ افزودن مورد", f"add:{trip['id']}"), ("🗑️ مدیریت", f"manage:{trip['id']}")], [("📋 فعالیت‌ها", f"activity:{trip['id']}")]]
+        keyboard += [[("➕ افزودن مورد", f"add:{trip['id']}"), ("🗑️ حذف آیتم", f"manage:{trip['id']}")], [("📋 فعالیت‌ها", f"activity:{trip['id']}")]]
     else:
-        keyboard.append([("📋 فعالیت‌ها", f"activity:{trip['id']}")])
+        keyboard.append([("📋 تاریخچه فعالیت‌ها", f"activity:{trip['id']}")])
     return "\n".join(lines), keyboard
 
 def format_departure(value: str, timezone_name: str) -> str:
     try:
-        date = datetime.fromisoformat(value)
-        return f"{fa_number(date.strftime('%Y/%m/%d'))}، ساعت {fa_number(date.strftime('%H:%M'))} ({timezone_name})"
-    except ValueError:
+        return format_shamsi_departure(value, timezone_name)
+    except (TypeError, ValueError):
         return "زمان نامشخص"

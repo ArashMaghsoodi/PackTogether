@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -28,26 +29,47 @@ class TripService:
         self.db = db
 
     def create_trip(self, chat_id: int, name: str, departure_at: str, timezone_name: str, user_id: int) -> int:
+        if chat_id >= 0:
+            raise TripError("سفر فقط در گروه قابل ساخت است.")
         name = name.strip()
         if not name or len(name) > 80:
             raise TripError("نام سفر باید بین ۱ تا ۸۰ نویسه باشد.")
+        try:
+            departure = datetime.fromisoformat(departure_at)
+        except ValueError as error:
+            raise TripError("زمان حرکت معتبر نیست.") from error
+        if departure.tzinfo is None or departure <= datetime.now(timezone.utc):
+            raise TripError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً تاریخ و ساعت آینده‌ای را وارد کنید.")
         with self.db.transaction() as cx:
+            self._reconcile_chat(cx, chat_id)
             existing = cx.execute("SELECT id FROM trips WHERE chat_id=? AND status='packing'", (chat_id,)).fetchone()
             if existing:
                 raise TripError("این گروه از قبل یک سفر فعال دارد.")
-            cursor = cx.execute(
-                "INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,created_at) VALUES(?,?,?,?,?,?)",
-                (chat_id, name, departure_at, timezone_name, user_id, now_iso()),
-            )
+            try:
+                cursor = cx.execute(
+                    "INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,created_at) VALUES(?,?,?,?,?,?)",
+                    (chat_id, name, departure_at, timezone_name, user_id, now_iso()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise TripError("این گروه در حال حاضر یک سفر فعال دارد.") from error
             trip_id = cursor.lastrowid
             cx.execute("INSERT INTO activities(trip_id,user_id,action,created_at) VALUES(?,?,?,?)", (trip_id, user_id, "trip_created", now_iso()))
             return int(trip_id)
+
+    def _reconcile_chat(self, cx, chat_id: int) -> None:
+        for trip in cx.execute("SELECT * FROM trips WHERE chat_id=? AND status='packing'", (chat_id,)).fetchall():
+            self._lock_if_due(cx, trip)
 
     def trip_for_chat(self, chat_id: int) -> Any:
         trip = self.db.connection.execute("SELECT * FROM trips WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
         if not trip:
             raise NotFound("هنوز چک‌لیستی ساخته نشده است.")
         return trip
+
+    def active_trip(self, chat_id: int) -> Any:
+        with self.db.transaction() as cx:
+            self._reconcile_chat(cx, chat_id)
+            return cx.execute("SELECT * FROM trips WHERE chat_id=? AND status='packing' ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
 
     def attach_message(self, trip_id: int, message_id: int) -> None:
         self.db.connection.execute("UPDATE trips SET message_id=? WHERE id=?", (message_id, trip_id))
@@ -68,7 +90,50 @@ class TripService:
             return self._lock_if_due(cx, trip)
 
     def due_trips(self) -> list[Any]:
-        return list(self.db.connection.execute("SELECT * FROM trips WHERE status='packing' AND departure_at <= ?", (now_iso(),)))
+        now = datetime.now(timezone.utc)
+        return [trip for trip in self.db.connection.execute("SELECT * FROM trips WHERE status='packing'") if datetime.fromisoformat(trip["departure_at"]) <= now]
+
+    def setup(self, chat_id: int, user_id: int) -> Any:
+        return self.db.connection.execute("SELECT * FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+
+    def begin_setup(self, chat_id: int, user_id: int) -> bool:
+        with self.db.transaction() as cx:
+            if cx.execute("SELECT 1 FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone():
+                return False
+            timestamp = now_iso()
+            cx.execute("INSERT INTO setup_sessions(chat_id,user_id,state,created_at,updated_at) VALUES(?,?,?,?,?)", (chat_id, user_id, "name", timestamp, timestamp))
+            return True
+
+    def update_setup(self, chat_id: int, user_id: int, state: str, *, trip_name: str | None = None, departure_date: str | None = None) -> None:
+        with self.db.transaction() as cx:
+            cx.execute("UPDATE setup_sessions SET state=?, trip_name=COALESCE(?, trip_name), departure_date=COALESCE(?, departure_date), updated_at=? WHERE chat_id=? AND user_id=?", (state, trip_name, departure_date, now_iso(), chat_id, user_id))
+
+    def cancel_setup(self, chat_id: int, user_id: int) -> bool:
+        with self.db.transaction() as cx:
+            return cx.execute("DELETE FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)).rowcount == 1
+
+    def complete_setup(self, chat_id: int, user_id: int, departure_at: str) -> int:
+        with self.db.transaction() as cx:
+            setup = cx.execute("SELECT * FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+            if not setup or not setup["trip_name"]:
+                raise NotFound("جلسه ساخت سفر پیدا نشد.")
+            try:
+                departure = datetime.fromisoformat(departure_at)
+            except ValueError as error:
+                raise TripError("زمان حرکت معتبر نیست.") from error
+            if departure.tzinfo is None or departure <= datetime.now(timezone.utc):
+                raise TripError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً تاریخ و ساعت آینده‌ای را وارد کنید.")
+            self._reconcile_chat(cx, chat_id)
+            existing = cx.execute("SELECT id FROM trips WHERE chat_id=? AND status='packing'", (chat_id,)).fetchone()
+            if existing:
+                raise TripError("این گروه از قبل یک سفر فعال دارد.")
+            try:
+                trip_id = cx.execute("INSERT INTO trips(chat_id,name,departure_at,timezone,created_by,created_at) VALUES(?,?,?,?,?,?)", (chat_id, setup["trip_name"], departure_at, "Asia/Tehran", user_id, now_iso())).lastrowid
+            except sqlite3.IntegrityError as error:
+                raise TripError("این گروه در حال حاضر یک سفر فعال دارد.") from error
+            cx.execute("INSERT INTO activities(trip_id,user_id,action,created_at) VALUES(?,?,?,?)", (trip_id, user_id, "trip_created", now_iso()))
+            cx.execute("DELETE FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+            return int(trip_id)
 
     def add_item(self, trip_id: int, name: str, user_id: int) -> int:
         name = name.strip()

@@ -37,7 +37,9 @@ def test_delete_and_progress_pagination():
 
 
 def test_lock_is_persistent_and_rejects_changes():
-    s = service(); t = trip(s, (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
+    s = service()
+    t = s.db.connection.execute("INSERT INTO trips(chat_id,name,departure_at,timezone,status,created_by,created_at) VALUES(?,?,?,?,?,?,datetime('now'))", (-100, "سفر شمال", (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), "Asia/Tehran", "packing", 1)).lastrowid
+    s.db.connection.commit()
     s.refresh_lock(t)
     assert s.trip_for_chat(-100)["status"] == "locked"
     try:

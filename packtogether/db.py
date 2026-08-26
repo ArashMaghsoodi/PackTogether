@@ -11,7 +11,7 @@ SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS trips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL UNIQUE,
+    chat_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     departure_at TEXT NOT NULL,
     timezone TEXT NOT NULL,
@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS activities (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS activities_trip_time ON activities(trip_id, id DESC);
+CREATE TABLE IF NOT EXISTS setup_sessions (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('name', 'date', 'time')),
+    trip_name TEXT,
+    departure_date TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, user_id)
+);
 """
 
 
@@ -63,7 +73,19 @@ class Database:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=30000")
         self.connection.executescript(SCHEMA)
+        self._migrate_trip_constraint()
         self.connection.commit()
+
+    def _migrate_trip_constraint(self) -> None:
+        table_sql = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='trips'").fetchone()[0]
+        if "chat_id INTEGER NOT NULL UNIQUE" in table_sql:
+            self.connection.execute("PRAGMA foreign_keys=OFF")
+            self.connection.execute("CREATE TABLE trips_new (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, name TEXT NOT NULL, departure_at TEXT NOT NULL, timezone TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'packing' CHECK(status IN ('packing', 'locked')), message_id INTEGER, created_by INTEGER NOT NULL, created_at TEXT NOT NULL)")
+            self.connection.execute("INSERT INTO trips_new SELECT id, chat_id, name, departure_at, timezone, status, message_id, created_by, created_at FROM trips")
+            self.connection.execute("DROP TABLE trips")
+            self.connection.execute("ALTER TABLE trips_new RENAME TO trips")
+            self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS trips_one_active_per_chat ON trips(chat_id) WHERE status='packing'")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
