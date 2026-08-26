@@ -70,3 +70,13 @@ def test_activity_records_actor_and_item_snapshots():
     assert "سفر شمال: رضا آیتم «قلیان» را حذف کرد." in lines
     assert "آرش سفر «سفر شمال» را ساخت." in lines
     assert all("مورد را" not in line for line in lines)
+
+
+def test_batch_add_items_creates_one_item_per_line_and_activity():
+    s = service(); t = trip(s)
+    item_ids = s.add_items(t, ["  چادر  ", "", "چراغ قوه", "کیسه خواب\n"], 2, "سارا")
+    rows = s.db.connection.execute("SELECT name, position FROM items WHERE trip_id=? ORDER BY position", (t,)).fetchall()
+    assert item_ids and [row["name"] for row in rows] == ["چادر", "چراغ قوه", "کیسه خواب"]
+    events = s.activities(t)
+    assert [event["item_name"] for event in events[:3]] == ["کیسه خواب", "چراغ قوه", "چادر"]
+    assert all(event["actor_name"] == "سارا" for event in events[:3])

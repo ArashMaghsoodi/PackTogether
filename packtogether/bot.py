@@ -118,7 +118,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_trip = context.user_data.get("add_item")
     if add_trip:
         try:
-            service.add_item(add_trip, update.effective_message.text, update.effective_user.id, update.effective_user.first_name)
+            service.add_items(add_trip, update.effective_message.text.splitlines(), update.effective_user.id, update.effective_user.first_name)
             context.user_data.pop("add_item", None); await show(update, service, service.trip_for_chat(update.effective_chat.id))
         except (TripError, NotFound) as error:
             await update.effective_message.reply_text(str(error))
@@ -152,7 +152,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer()
             await show(update, service, trip)
         elif kind == "add":
-            context.user_data["add_item"] = trip["id"]; await query.answer(); await query.message.reply_text("موردی که می‌خواهید اضافه کنید را ارسال کنید.")
+            context.user_data["add_item"] = trip["id"]; await query.answer(); await query.message.reply_text("مورد یا مواردی که می‌خواهید اضافه کنید را بفرستید؛ هر مورد را در یک خط بنویسید.")
         elif kind == "page": await query.answer(); await show(update, service, trip, int(rest[0]))
         elif kind == "confirm":
             if context.user_data.get("delete_item") != int(rest[0]): raise NotFound("درخواست حذف منقضی شده است.")

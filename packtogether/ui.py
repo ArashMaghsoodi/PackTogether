@@ -32,7 +32,7 @@ def render_checklist(trip, items, page: int, pages: int, packed: int, total: int
     percent = int(packed * 16 / total) if total else 0
     bar = "█" * percent + "░" * (16 - percent)
     title = "🔒 " + trip["name"] + " — سفر شروع شد" if trip["status"] == "locked" else "🧳 " + trip["name"]
-    lines = [title, "", f"{fa_number(packed)} / {fa_number(total)} مورد آماده است", bar, ""]
+    lines = [title, "", f"{fa_number(packed)} از {fa_number(total)} مورد آماده است", bar, ""]
     keyboard = []
     for item in items:
         contributors = f" ({item['contributors']})" if item["contributors"] else ""

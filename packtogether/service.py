@@ -143,15 +143,25 @@ class TripService:
             return int(trip_id)
 
     def add_item(self, trip_id: int, name: str, user_id: int, actor_display_name: str = "کاربر") -> int:
-        name = name.strip()
+        item_ids = self.add_items(trip_id, [name], user_id, actor_display_name)
+        return item_ids[0]
+
+    def add_items(self, trip_id: int, names: list[str], user_id: int, actor_display_name: str = "کاربر") -> list[int]:
+        names = [name.strip() for name in names if name.strip()]
+        if not names:
+            raise TripError("لطفاً حداقل یک مورد وارد کنید.")
         with self.db.transaction() as cx:
             trip = cx.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
             if not trip: raise NotFound("سفر پیدا نشد.")
             if self._lock_if_due(cx, trip) or trip["status"] == "locked": raise Locked()
             position = cx.execute("SELECT COALESCE(MAX(position), -1)+1 FROM items WHERE trip_id=?", (trip_id,)).fetchone()[0]
-            item_id = cx.execute("INSERT INTO items(trip_id,name,position,created_by,created_at) VALUES(?,?,?,?,?)", (trip_id, name, position, user_id, now_iso())).lastrowid
-            self._record_activity(cx, trip_id, user_id, ITEM_ADDED, actor_display_name, item_id, name)
-            return int(item_id)
+            item_ids = []
+            for name in names:
+                item_id = cx.execute("INSERT INTO items(trip_id,name,position,created_by,created_at) VALUES(?,?,?,?,?)", (trip_id, name, position, user_id, now_iso())).lastrowid
+                self._record_activity(cx, trip_id, user_id, ITEM_ADDED, actor_display_name, item_id, name)
+                item_ids.append(int(item_id))
+                position += 1
+            return item_ids
 
     def toggle_contribution(self, trip_id: int, item_id: int, user_id: int, display_name: str, actor_display_name: str | None = None) -> Change:
         with self.db.transaction() as cx:

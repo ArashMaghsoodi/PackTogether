@@ -23,7 +23,7 @@ PackTogether is a Persian-first collaborative Telegram packing checklist. It kee
 
 ## Usage
 
-In a group, use `/newtrip`, then send the Persian trip name, a Jalali date such as `1405.06.17`, and a time such as `14:30`. Only the member who started setup can answer or cancel it. Private-chat `/newtrip` is rejected and is not included in the private command menu. Members can add items, tap an item to claim or unclaim it, inspect activity, and use the per-user management message to select and confirm deletion. All UI text is Persian and display dates use Jalali format.
+In a group, use `/newtrip`, then send the Persian trip name, a Jalali date such as `1405.06.17`, and a time such as `14:30`. Only the member who started setup can answer or cancel it. Private-chat `/newtrip` is rejected and is not included in the private command menu. Members can add one or several items by sending one item per line, tap an item to claim or unclaim it, inspect activity, and use the per-user management message to select and confirm deletion. All UI text is Persian and display dates use Jalali format.
 
 Departure timestamps are stored as UTC ISO-8601 values after converting the supplied Jalali date/time in the `Asia/Tehran` IANA timezone. Users never need to enter Gregorian dates or timezone offsets. Departures must be strictly in the future. The service checks due trips during every read and write, so a restart after departure still locks the trip. Historical trips remain stored; only one `packing` trip is allowed per group.
 
