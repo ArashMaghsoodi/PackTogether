@@ -84,10 +84,24 @@ class TripService:
 
     def _lock_if_due(self, cx, trip) -> bool:
         if trip["status"] == "packing" and datetime.fromisoformat(trip["departure_at"]) <= datetime.now(timezone.utc):
-            cx.execute("UPDATE trips SET status='locked' WHERE id=? AND status='packing'", (trip["id"],))
-            self._record_activity(cx, trip["id"], trip["created_by"], TRIP_LOCKED, trip["creator_name"] or "کاربر")
-            return True
+            return self._lock_trip(cx, trip, trip["created_by"], trip["creator_name"] or "کاربر")
         return False
+
+    def _lock_trip(self, cx, trip, user_id: int, actor_display_name: str) -> bool:
+        if trip["status"] != "packing":
+            return False
+        cx.execute("UPDATE trips SET status='locked' WHERE id=? AND status='packing'", (trip["id"],))
+        self._record_activity(cx, trip["id"], user_id, TRIP_LOCKED, actor_display_name)
+        return True
+
+    def start_trip(self, trip_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
+        with self.db.transaction() as cx:
+            trip = cx.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
+            if not trip:
+                raise NotFound("سفر پیدا نشد.")
+            if trip["status"] == "locked":
+                raise Locked()
+            self._lock_trip(cx, trip, user_id, actor_display_name)
 
     def refresh_lock(self, trip_id: int) -> bool:
         with self.db.transaction() as cx:
@@ -186,14 +200,26 @@ class TripService:
             return Change(item_id, claimed, duplicate_names)
 
     def delete_item(self, trip_id: int, item_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
+        self.delete_items(trip_id, [item_id], user_id, actor_display_name)
+
+    def delete_items(self, trip_id: int, item_ids: list[int], user_id: int, actor_display_name: str = "کاربر") -> int:
+        if not item_ids:
+            raise TripError("لطفاً حداقل یک مورد برای حذف انتخاب کنید.")
         with self.db.transaction() as cx:
             trip = cx.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
             if not trip: raise NotFound("سفر پیدا نشد.")
             if self._lock_if_due(cx, trip) or trip["status"] == "locked": raise Locked()
-            item = cx.execute("SELECT * FROM items WHERE id=? AND trip_id=? AND deleted_at IS NULL", (item_id, trip_id)).fetchone()
-            if not item: raise NotFound("این مورد دیگر وجود ندارد.")
-            cx.execute("UPDATE items SET deleted_at=? WHERE id=? AND deleted_at IS NULL", (now_iso(), item_id))
-            self._record_activity(cx, trip_id, user_id, ITEM_DELETED, actor_display_name, item_id, item["name"])
+            unique_ids = list(dict.fromkeys(item_ids))
+            placeholders = ",".join("?" for _ in unique_ids)
+            items = cx.execute(f"SELECT * FROM items WHERE trip_id=? AND deleted_at IS NULL AND id IN ({placeholders})", (trip_id, *unique_ids)).fetchall()
+            items_by_id = {item["id"]: item for item in items}
+            if len(items_by_id) != len(unique_ids):
+                raise NotFound("یکی از موارد دیگر وجود ندارد.")
+            deleted_at = now_iso()
+            cx.executemany("UPDATE items SET deleted_at=? WHERE id=? AND deleted_at IS NULL", [(deleted_at, item_id) for item_id in unique_ids])
+            for item_id in unique_ids:
+                self._record_activity(cx, trip_id, user_id, ITEM_DELETED, actor_display_name, item_id, items_by_id[item_id]["name"])
+            return len(unique_ids)
 
     @staticmethod
     def _record_activity(cx, trip_id: int, user_id: int, action: str, actor_name: str, item_id: int | None = None, item_name: str | None = None) -> None:

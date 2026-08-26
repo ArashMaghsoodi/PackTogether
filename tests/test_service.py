@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from packtogether.db import Database
-from packtogether.service import Locked, TripService
+from packtogether.service import Locked, NotFound, TripService
 from packtogether.ui import render_activity_line
 
 
@@ -67,8 +69,8 @@ def test_activity_records_actor_and_item_snapshots():
     assert [(event["action"], event["actor_name"], event["item_name"]) for event in events[:4]] == [("item_deleted", "رضا", "قلیان"), ("item_unchecked", "علی", "قلیان"), ("item_checked", "علی", "قلیان"), ("item_added", "حسین", "قلیان")]
     assert events[-1]["actor_name"] == "آرش"
     lines = [render_activity_line("سفر شمال", event) for event in events]
-    assert "سفر شمال: رضا آیتم «قلیان» را حذف کرد." in lines
-    assert "آرش سفر «سفر شمال» را ساخت." in lines
+    assert "🗑️ سفر شمال: رضا آیتم «قلیان» را حذف کرد." in lines
+    assert "✨ آرش سفر «سفر شمال» را ساخت." in lines
     assert all("مورد را" not in line for line in lines)
 
 
@@ -80,3 +82,24 @@ def test_batch_add_items_creates_one_item_per_line_and_activity():
     events = s.activities(t)
     assert [event["item_name"] for event in events[:3]] == ["کیسه خواب", "چراغ قوه", "چادر"]
     assert all(event["actor_name"] == "سارا" for event in events[:3])
+
+
+def test_batch_delete_items_records_each_item_and_is_atomic():
+    s = service(); t = trip(s)
+    item_ids = [s.add_item(t, name, 1) for name in ("چادر", "چراغ", "کوله")]
+    assert s.delete_items(t, item_ids[:2], 2, "سارا") == 2
+    assert s.progress(t) == (0, 1)
+    assert [event["item_name"] for event in s.activities(t)[:2]] == ["چراغ", "چادر"]
+    with pytest.raises(NotFound):
+        s.delete_items(t, [item_ids[2], 999999], 2, "سارا")
+    assert s.progress(t) == (0, 1)
+
+
+def test_start_trip_locks_immediately_and_records_actor():
+    s = service(); t = trip(s)
+    s.start_trip(t, 7, "سارا")
+    assert s.trip_for_chat(-100)["status"] == "locked"
+    event = s.activities(t)[0]
+    assert (event["action"], event["actor_name"]) == ("trip_locked", "سارا")
+    with pytest.raises(Locked):
+        s.add_item(t, "چادر", 1)

@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 from dotenv import load_dotenv
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-try:
+if __package__:
     from .date_utils import TEHRAN, jalali_to_utc, validate_departure_date
     from .db import Database
     from .service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
     from .ui import render_activity_line, render_checklist
-except ImportError:
+else:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from packtogether.date_utils import TEHRAN, jalali_to_utc, validate_departure_date
     from packtogether.db import Database
     from packtogether.service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
@@ -28,48 +31,59 @@ def markup(rows):
 def cancel_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="setup_cancel")]])
 
-DATE_PROMPT = "📅 تاریخ حرکت را وارد کنید.\n\nمثال:\n1405.06.17"
-TIME_PROMPT = "🕐 ساعت حرکت را وارد کنید.\n\nمثال:\n14:30"
+DATE_PROMPT = "📅 تاریخ حرکت سفر رو بفرست.\n\nمثال:\n1405.06.17"
+TIME_PROMPT = "🕐 ساعت حرکت رو بفرست.\n\nمثال:\n14:30"
 
 async def show(update, service, trip, page=0, main_message=False):
     trip = service.trip_for_chat(trip["chat_id"])
     items, page, pages = service.page(trip["id"], page)
     text, rows = render_checklist(trip, items, page, pages, *service.progress(trip["id"]))
+    async def send_checklist():
+        message = await update.get_bot().send_message(trip["chat_id"], text, reply_markup=markup(rows))
+        service.attach_message(trip["id"], message.message_id)
+
     if update.callback_query and not main_message:
         await update.callback_query.edit_message_text(text, reply_markup=markup(rows))
     elif trip["message_id"]:
-        await update.get_bot().edit_message_text(text, chat_id=trip["chat_id"], message_id=trip["message_id"], reply_markup=markup(rows))
+        try:
+            await update.get_bot().edit_message_text(text, chat_id=trip["chat_id"], message_id=trip["message_id"], reply_markup=markup(rows))
+        except BadRequest as error:
+            error_text = str(error).lower()
+            if "not modified" in error_text:
+                return
+            if not any(phrase in error_text for phrase in ("message to edit not found", "message can't be edited", "message cannot be edited")):
+                raise
+            await send_checklist()
     else:
-        message = await update.effective_message.reply_text(text, reply_markup=markup(rows))
-        service.attach_message(trip["id"], message.message_id)
+        await send_checklist()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     try:
         await show(update, service, service.trip_for_chat(update.effective_chat.id))
     except NotFound:
-        await update.effective_message.reply_text("سلام! برای ساخت چک‌لیست سفر، نام و زمان حرکت را با /newtrip ثبت کنید.")
+        await update.effective_message.reply_text("سلام 👋\nبرای ساخت چک‌لیست سفر، دستور /newtrip رو داخل گروه بفرست.")
 
 async def new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     if service.active_trip(update.effective_chat.id):
-        await update.effective_message.reply_text("⚠️ این گروه در حال حاضر یک سفر فعال دارد.\n\nلطفاً ابتدا همان سفر را به پایان برسانید یا تا زمان حرکت آن صبر کنید.")
+        await update.effective_message.reply_text("⚠️ این گروه الان یک سفر فعال داره.\n\nاول همین سفر رو مدیریت کنید یا تا زمان حرکتش صبر کنید.")
         return
     if not service.begin_setup(update.effective_chat.id, update.effective_user.id):
-        await update.effective_message.reply_text("ℹ️ شما در حال ساخت یک سفر هستید. ابتدا همان سفر را کامل یا لغو کنید.")
+        await update.effective_message.reply_text("ℹ️ شما همین الان در حال ساخت یک سفر هستید.\nاول همون رو کامل کن یا لغوش کن.")
         return
-    await update.effective_message.reply_text("🧳 ساخت سفر جدید\n\nنام سفر را وارد کنید:", reply_markup=cancel_markup())
+    await update.effective_message.reply_text("🧳 بزن بریم سفر جدید!\n\nاسم سفر رو وارد کن:", reply_markup=cancel_markup())
 
 async def private_new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("⚠️ برای ساخت سفر، دستور /newtrip را داخل گروهی که PackTogether در آن عضو است ارسال کنید.")
+    await update.effective_message.reply_text("⚠️ برای ساخت سفر باید /newtrip رو داخل گروهی بفرستی که PackTogether اونجاست.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("برای ساخت چک‌لیست، در گروه دستور /newtrip را بفرستید.")
+    await update.effective_message.reply_text("راهنما ✨\nبرای ساخت چک‌لیست، داخل گروه دستور /newtrip رو بفرست.")
 
 async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
-        await update.effective_message.reply_text("❌ ساخت سفر لغو شد.")
+        await update.effective_message.reply_text("❌ ساخت سفر لغو شد. هر زمان خواستی دوباره /newtrip رو بزن.")
 
 def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now=None, actor_display_name: str = "هم‌گروهی") -> tuple[str, int | None]:
     setup = service.setup(chat_id, user_id)
@@ -78,7 +92,7 @@ def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now
     text = text.strip()
     if text == "لغو":
         service.cancel_setup(chat_id, user_id)
-        return "❌ ساخت سفر لغو شد.", None
+        return "❌ ساخت سفر لغو شد. هر زمان خواستی دوباره /newtrip رو بزن.", None
     if setup["state"] == "name":
         if not text or len(text) > 80:
             return "❌ نام سفر باید بین ۱ تا ۸۰ نویسه باشد.", None
@@ -97,7 +111,7 @@ def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now
     if departure <= current.astimezone(timezone.utc):
         raise ValueError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً ساعت آینده‌ای را وارد کنید.")
     trip_id = service.complete_setup(chat_id, user_id, departure.isoformat(), actor_display_name)
-    return "✅ سفر آماده شد!", trip_id
+    return "✅ سفر آماده شد! وقتشه وسایل رو تیک بزنید 🚀", trip_id
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
@@ -129,9 +143,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if query.data == "setup_cancel":
             if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
-                await query.answer(); await query.edit_message_text("❌ ساخت سفر لغو شد.")
+                await query.answer(); await query.edit_message_text("❌ ساخت سفر لغو شد. هر زمان خواستی دوباره /newtrip رو بزن.")
             else:
-                await query.answer("این جلسه دیگر فعال نیست.", show_alert=True)
+                await query.answer("این جلسه دیگه فعال نیست.", show_alert=True)
             return
         kind, trip_id, *rest = query.data.split(":")
         trip = service.trip_for_chat(update.effective_chat.id)
@@ -141,9 +155,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if context.user_data.get("manage_trip") == trip["id"]:
                 item = service.db.connection.execute("SELECT name FROM items WHERE id=? AND trip_id=? AND deleted_at IS NULL", (item_id, trip["id"])).fetchone()
                 if not item: raise NotFound("این مورد دیگر وجود ندارد.")
-                context.user_data["delete_item"] = item_id
+                selected = set(context.user_data.get("delete_items", []))
+                if item_id in selected: selected.remove(item_id)
+                else: selected.add(item_id)
+                context.user_data["delete_items"] = list(selected)
                 await query.answer()
-                await query.edit_message_text(f"🗑️ حذف مورد\n\n{item['name']}", reply_markup=markup([[('بله، حذف شود', f'confirm:{trip["id"]}:{item_id}'), ('خیر، لغو', f'cancel:{trip["id"]}')]]))
+                await render_manage(query, service, trip, context)
                 return
             change = service.toggle_contribution(trip["id"], item_id, update.effective_user.id, update.effective_user.first_name)
             if change.duplicate_names:
@@ -152,32 +169,51 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer()
             await show(update, service, trip)
         elif kind == "add":
-            context.user_data["add_item"] = trip["id"]; await query.answer(); await query.message.reply_text("مورد یا مواردی که می‌خواهید اضافه کنید را بفرستید؛ هر مورد را در یک خط بنویسید.")
+            context.user_data["add_item"] = trip["id"]; await query.answer(); await query.message.reply_text("➕ آیتم‌ها رو بفرست.\nهر مورد رو در یک خط جدا بنویس ✍️")
         elif kind == "page": await query.answer(); await show(update, service, trip, int(rest[0]))
         elif kind == "confirm":
-            if context.user_data.get("delete_item") != int(rest[0]): raise NotFound("درخواست حذف منقضی شده است.")
-            service.delete_item(trip["id"], int(rest[0]), update.effective_user.id, update.effective_user.first_name)
-            context.user_data.pop("delete_item", None); context.user_data.pop("manage_trip", None)
+            item_ids = context.user_data.get("delete_items", [])
+            if not item_ids: raise NotFound("هیچ موردی برای حذف انتخاب نشده است.")
+            service.delete_items(trip["id"], item_ids, update.effective_user.id, update.effective_user.first_name)
+            context.user_data.pop("delete_items", None); context.user_data.pop("manage_trip", None)
             await query.answer()
             await query.message.delete()
             await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
         elif kind == "cancel":
-            context.user_data.pop("delete_item", None); context.user_data.pop("manage_trip", None)
+            context.user_data.pop("delete_items", None); context.user_data.pop("manage_trip", None)
             await query.answer()
-            await query.edit_message_text("حذف لغو شد.")
+            await query.edit_message_text("↩️ حذف لغو شد.")
+        elif kind == "start":
+            await query.answer()
+            await query.edit_message_text("🚀 شروع فوری سفر\n\nبعد از شروع، افزودن، تیک‌زدن و حذف آیتم‌ها ممکن نیست.", reply_markup=markup([[("✅ بله، سفر را شروع کن", f"start_confirm:{trip['id']}"), ("↩️ لغو", f"cancel:{trip['id']}")]]))
+        elif kind == "start_confirm":
+            service.start_trip(trip["id"], update.effective_user.id, update.effective_user.first_name)
+            await query.answer()
+            await query.message.delete()
+            await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
         elif kind == "activity":
-            lines = ["📋 فعالیت‌های اخیر", ""]
+            lines = ["🕓 فعالیت‌های اخیر", ""]
             lines.extend(render_activity_line(trip["name"], row) for row in service.activities(trip["id"]))
             await query.answer(); await query.message.reply_text("\n".join(lines))
         elif kind == "manage":
-            items, page, pages = service.page(trip["id"])
             context.user_data["manage_trip"] = trip["id"]
-            rows = [[(f"{'✓' if item['contributors'] else ' '} {item['name']}", f"item:{trip['id']}:{item['id']}")] for item in items]
-            rows.append([("لغو", f"cancel:{trip['id']}")])
-            await query.answer(); await query.message.reply_text("🗑️ برای حذف، روی مورد موردنظر بزنید.", reply_markup=markup(rows))
+            context.user_data["delete_items"] = []
+            await query.answer(); await render_manage(query, service, trip, context)
     except Locked: await query.answer("🔒 این سفر شروع شده و چک‌لیست قفل است.", show_alert=True)
     except (TripError, ValueError) as error: await query.answer(str(error), show_alert=True)
     except Exception: log.exception("callback failed")
+
+async def render_manage(query, service, trip, context):
+    items, _, _ = service.page(trip["id"])
+    selected = set(context.user_data.get("delete_items", []))
+    rows = [[(f"{'✅' if item['id'] in selected else '⬜️'} {item['name']}", f"item:{trip['id']}:{item['id']}")] for item in items]
+    if selected:
+        rows.append([("🗑️ حذف موارد انتخاب‌شده", f"confirm:{trip['id']}")])
+    rows.append([("↩️ خروج از مدیریت", f"cancel:{trip['id']}")])
+    text = "🗂 حالت مدیریت آیتم‌ها\n\nمواردی را که می‌خواهی حذف شوند انتخاب کن."
+    if selected:
+        text += f"\n\n✅ {len(selected)} مورد انتخاب شده"
+    await query.edit_message_text(text, reply_markup=markup(rows))
 
 def build_application() -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
