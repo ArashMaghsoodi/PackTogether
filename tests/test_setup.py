@@ -78,14 +78,11 @@ def test_owner_can_complete_or_cancel_and_other_user_cannot_cancel():
     assert app_service.setup(-20, 1) is None
 
 
-def test_setup_survives_database_reopen(tmp_path):
-    path = tmp_path / "bot.sqlite3"
-    first = service(path)
-    first.begin_setup(-30, 7)
-    setup_input(first, -30, 7, "سفر کویر")
-    first.db.close()
-    second = service(path)
-    assert second.setup(-30, 7)["trip_name"] == "سفر کویر"
+def test_setup_lifecycle_in_memory():
+    app_service = service()
+    app_service.begin_setup(-30, 7)
+    setup_input(app_service, -30, 7, "سفر کویر")
+    assert app_service.setup(-30, 7)["trip_name"] == "سفر کویر"
 
 
 def test_past_departure_is_rejected_without_creating_trip():
@@ -132,23 +129,20 @@ def test_past_date_error_is_distinct_from_time_prompt():
 
 def test_historical_trip_does_not_block_new_active_trip():
     app_service = service()
-    old = app_service.db.connection.execute("INSERT INTO trips(chat_id,name,departure_at,timezone,status,created_by,created_at) VALUES(?,?,?,?,?,?,datetime('now'))", (-50, "قدیمی", "2020-01-01T00:00:00+00:00", "Asia/Tehran", "locked", 1)).lastrowid
-    app_service.db.connection.commit()
+    old = app_service.db.insert_returning_id(
+        "INSERT INTO trips(chat_id,name,departure_at,status,created_by,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+        (-50, "قدیمی", "2020-01-01T00:00:00+00:00", "locked", 1, "2020-01-01T00:00:00+00:00"),
+    )
     new = app_service.create_trip(-50, "جدید", "2099-01-01T00:00:00+00:00", "Asia/Tehran", 2)
     assert new != old
-    assert app_service.db.connection.execute("SELECT COUNT(*) FROM trips WHERE chat_id=?", (-50,)).fetchone()[0] == 2
+    assert app_service.db.scalar("SELECT COUNT(*) FROM trips WHERE chat_id=?", (-50,)) == 2
 
 
-def test_legacy_unique_chat_schema_migrates_without_losing_data(tmp_path):
-    import sqlite3
-    path = tmp_path / "legacy.sqlite3"
-    connection = sqlite3.connect(path)
-    connection.executescript("CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL UNIQUE, name TEXT NOT NULL, departure_at TEXT NOT NULL, timezone TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'packing', message_id INTEGER, created_by INTEGER NOT NULL, created_at TEXT NOT NULL); CREATE TABLE items (id INTEGER PRIMARY KEY, trip_id INTEGER REFERENCES trips(id), name TEXT NOT NULL, position INTEGER NOT NULL, created_by INTEGER NOT NULL, created_at TEXT NOT NULL, deleted_at TEXT); CREATE TABLE contributions (item_id INTEGER, user_id INTEGER, display_name TEXT, claimed_at TEXT, PRIMARY KEY(item_id,user_id)); CREATE TABLE activities (id INTEGER PRIMARY KEY, trip_id INTEGER REFERENCES trips(id), user_id INTEGER, action TEXT, item_id INTEGER, item_name TEXT, created_at TEXT); INSERT INTO trips VALUES(1,-60,'قدیمی','2020-01-01T00:00:00+00:00','Asia/Tehran','locked',NULL,1,'2020-01-01'); INSERT INTO items VALUES(1,1,'چادر',0,1,'2020-01-01',NULL);")
-    connection.commit(); connection.close()
-    migrated = service(path)
-    assert migrated.db.connection.execute("SELECT name FROM trips WHERE id=1").fetchone()[0] == "قدیمی"
-    assert migrated.db.connection.execute("SELECT name FROM items WHERE id=1").fetchone()[0] == "چادر"
-    assert migrated.db.connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='trips_one_active_per_chat'").fetchone() is not None
+def test_new_sqlite_schema_bootstraps_cleanly(tmp_path):
+    path = tmp_path / "fresh.sqlite3"
+    app_service = service(path)
+    trip_id = app_service.create_trip(-60, "کوه", "2099-01-01T00:00:00+00:00", "Asia/Tehran", 1)
+    assert trip_id > 0
 
 
 def test_concurrent_trip_creation_allows_only_one_active_trip():
@@ -164,4 +158,4 @@ def test_concurrent_trip_creation_allows_only_one_active_trip():
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(create, (1, 2)))
     assert sum(result is not None for result in results) == 1
-    assert app_service.db.connection.execute("SELECT COUNT(*) FROM trips WHERE chat_id=? AND status='packing'", (-70,)).fetchone()[0] == 1
+    assert app_service.db.scalar("SELECT COUNT(*) FROM trips WHERE chat_id=? AND status='packing'", (-70,)) == 1

@@ -36,6 +36,13 @@ def fa_number(value: int | str) -> str:
 def render_activity_line(trip_name: str, activity) -> str:
     actor = activity["actor_name"] or "کاربر"
     emoji = ACTIVITY_EMOJIS.get(activity["action"], "📝")
+    desc = (activity.get("desc") or "").strip()
+
+    if desc:
+        if activity["action"] == "trip_created":
+            return f"{emoji} {desc}"
+        return f"{emoji} {trip_name}: {desc}"
+
     if activity["action"] == "trip_created":
         return f"{emoji} {actor} سفر «{trip_name}» را ساخت."
     sentence = ACTIVITY_LABELS.get(activity["action"], "تغییری ثبت کرد.").format(item=activity["item_name"] or "نامشخص")
@@ -50,11 +57,13 @@ def render_checklist(trip, items, page: int, pages: int, packed: int, total: int
     title = f"🔒 {trip['name']}" if trip["status"] == "locked" else f"🧳 {trip['name']}"
     subtitle = "سفر شروع شد و چک‌لیست قفل است." if trip["status"] == "locked" else "بزن بریم برای جمع کردن وسایل!"
 
+    timezone_name = trip.get("timezone") or "Asia/Tehran"
+
     lines = [
         title,
         subtitle,
         "",
-        f"🕐 زمان حرکت: {format_departure(trip['departure_at'], trip['timezone'])}",
+        f"🕐 زمان حرکت: {format_departure(trip['departure_at'], timezone_name)}",
     ]
 
     if trip["status"] == "packing":

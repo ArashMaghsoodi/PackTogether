@@ -11,13 +11,13 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 if __package__:
     from .date_utils import TEHRAN, jalali_to_utc, validate_departure_date
-    from .db import Database
+    from .db import database_from_env
     from .service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
     from .ui import render_activity_line, render_checklist
 else:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from packtogether.date_utils import TEHRAN, jalali_to_utc, validate_departure_date
-    from packtogether.db import Database
+    from packtogether.db import database_from_env
     from packtogether.service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
     from packtogether.ui import render_activity_line, render_checklist
 
@@ -153,7 +153,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "item":
             item_id = int(rest[0])
             if context.user_data.get("manage_trip") == trip["id"]:
-                item = service.db.connection.execute("SELECT name FROM items WHERE id=? AND trip_id=? AND deleted_at IS NULL", (item_id, trip["id"])).fetchone()
+                item = service.db.fetchone("SELECT name FROM items WHERE id=? AND trip_id=? AND status <> 'deleted'", (item_id, trip["id"]))
                 if not item: raise NotFound("این مورد دیگر وجود ندارد.")
                 selected = set(context.user_data.get("delete_items", []))
                 if item_id in selected: selected.remove(item_id)
@@ -220,12 +220,13 @@ def build_application() -> Application:
     if not token or token == "replace-with-botfather-token":
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Set it in .env or export it before starting the bot.")
     application = Application.builder().token(token).post_init(set_command_menus).build()
-    application.bot_data["service"] = TripService(Database(os.getenv("DATABASE_PATH", "packtogether.sqlite3")))
+    application.bot_data["service"] = TripService(database_from_env())
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("newtrip", new_trip, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("newtrip", private_new_trip, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(callback)); application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
+    application.add_error_handler(on_error)
     application.job_queue.run_repeating(lock_due_trips, interval=30, first=5)
     return application
 
@@ -244,11 +245,15 @@ async def lock_due_trips(context: ContextTypes.DEFAULT_TYPE):
     for trip in service.due_trips():
         try:
             if service.refresh_lock(trip["id"]) and trip["message_id"]:
-                locked_trip = service.db.connection.execute("SELECT * FROM trips WHERE id=?", (trip["id"],)).fetchone()
+                locked_trip = service.db.fetchone("SELECT * FROM trips WHERE id=?", (trip["id"],))
                 items, page, pages = service.page(trip["id"])
                 text, rows = render_checklist(locked_trip, items, page, pages, *service.progress(trip["id"]))
                 await context.bot.edit_message_text(text, chat_id=trip["chat_id"], message_id=trip["message_id"], reply_markup=markup(rows))
         except Exception:
             log.exception("scheduled trip lock failed for %s", trip["id"])
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("update handling failed", exc_info=context.error)
 
 if __name__ == "__main__": build_application().run_polling()

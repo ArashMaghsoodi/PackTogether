@@ -13,7 +13,8 @@ PackTogether is a Persian-first collaborative Telegram packing checklist. It kee
 	pip install -r requirements.txt
 	```
 
-3. Copy `.env.example` to `.env`, set `TELEGRAM_BOT_TOKEN`, and optionally set `DATABASE_PATH`.
+3. Copy `.env.example` to `.env`, set `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY`.
+   Optional alternatives: `SUPABASE_DB_URL` (direct Postgres DSN) or `DATABASE_PATH` (local SQLite fallback).
 4. Run the bot:
 
 	```bash
@@ -29,6 +30,6 @@ Departure timestamps are stored as UTC ISO-8601 values after converting the supp
 
 ## Tests and architecture
 
-Run `python3 -m pytest -q`. `packtogether/db.py` owns the SQLite schema and atomic transactions, `service.py` contains language-independent domain operations, `ui.py` renders the Persian checklist, and `bot.py` is the Telegram adapter. SQLite WAL mode and `BEGIN IMMEDIATE` serialize concurrent mutations; the contribution primary key prevents duplicate claims.
+Run `python3 -m pytest -q`. `packtogether/db.py` owns database connectivity (Supabase via `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, optional direct PostgreSQL DSN via `SUPABASE_DB_URL`, with SQLite fallback), `service.py` contains language-independent domain operations, `ui.py` renders the Persian checklist, and `bot.py` is the Telegram adapter.
 
-For deployment, run the polling process under a supervisor such as systemd, Docker, or a managed worker, and persist the SQLite database on a durable volume. The included `Dockerfile` starts the bot with `python -m packtogether.bot`. Set `TELEGRAM_BOT_TOKEN` in the deployment environment and set `DATABASE_PATH` to the mounted database location, such as `/data/packtogether.sqlite3`. The bot only uses `/start` and `/newtrip`; the normal workflow is inline buttons.
+For deployment, run the polling process under a supervisor such as systemd, Docker, or a managed worker. The included `Dockerfile` starts the bot with `python -m packtogether.bot`. Set `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY` in the deployment environment. The bot only uses `/start` and `/newtrip`; the normal workflow is inline buttons.
