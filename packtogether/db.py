@@ -23,10 +23,6 @@ CREATE TABLE IF NOT EXISTS trips (
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS trips_one_active_per_chat ON trips(chat_id) WHERE status='packing';
-CREATE INDEX IF NOT EXISTS trips_chat_id_idx ON trips(chat_id);
-CREATE INDEX IF NOT EXISTS trips_created_at_idx ON trips(created_at DESC);
-CREATE INDEX IF NOT EXISTS trips_departure_at_idx ON trips(departure_at);
 
 CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,9 +32,6 @@ CREATE TABLE IF NOT EXISTS items (
     created_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'unchecked' CHECK(status IN ('checked', 'unchecked', 'deleted'))
 );
-CREATE INDEX IF NOT EXISTS items_trip_id_idx ON items(trip_id);
-CREATE INDEX IF NOT EXISTS items_trip_status_idx ON items(trip_id, status);
-CREATE INDEX IF NOT EXISTS items_created_at_idx ON items(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS actions_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,6 +43,30 @@ CREATE TABLE IF NOT EXISTS actions_history (
     "timestamp" TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    dirty INTEGER NOT NULL DEFAULT 0,
+    dirty_since TEXT,
+    last_local_action_at TEXT,
+    unsynced_actions INTEGER NOT NULL DEFAULT 0,
+    last_sync_started_at TEXT,
+    last_sync_completed_at TEXT,
+    last_sync_status TEXT,
+    last_error TEXT
+);
+INSERT OR IGNORE INTO sync_state(id, dirty, unsynced_actions) VALUES (1, 0, 0);
+"""
+
+
+SQLITE_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS trips_one_active_per_chat ON trips(chat_id) WHERE status='packing';
+CREATE INDEX IF NOT EXISTS trips_chat_id_idx ON trips(chat_id);
+CREATE INDEX IF NOT EXISTS trips_created_at_idx ON trips(created_at DESC);
+CREATE INDEX IF NOT EXISTS trips_departure_at_idx ON trips(departure_at);
+CREATE INDEX IF NOT EXISTS items_trip_id_idx ON items(trip_id);
+CREATE INDEX IF NOT EXISTS items_trip_status_idx ON items(trip_id, status);
+CREATE INDEX IF NOT EXISTS items_created_at_idx ON items(created_at DESC);
 CREATE INDEX IF NOT EXISTS actions_history_trip_id_idx ON actions_history(trip_id);
 CREATE INDEX IF NOT EXISTS actions_history_timestamp_idx ON actions_history("timestamp" DESC);
 CREATE INDEX IF NOT EXISTS actions_history_expires_at_idx ON actions_history(expires_at);
@@ -122,6 +139,100 @@ class Database:
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA busy_timeout=30000")
             self.connection.executescript(SQLITE_SCHEMA)
+            self._migrate_sqlite_schema()
+            self.connection.executescript(SQLITE_INDEXES)
+
+    def _sqlite_has_column(self, table: str, column: str) -> bool:
+        rows = self.connection.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(row[1]) == column for row in rows)
+
+    def _sqlite_item_columns(self) -> list[str]:
+        rows = self.connection.execute("PRAGMA table_info(items)").fetchall()
+        return [str(row[1]) for row in rows]
+
+    def _rebuild_items_table_if_legacy_position(self) -> None:
+        columns = self._sqlite_item_columns()
+        if "position" not in columns:
+            return
+
+        has_created_by = "created_by" in columns
+        has_created_at = "created_at" in columns
+        has_status = "status" in columns
+
+        select_created_by = "created_by" if has_created_by else "0"
+        select_created_at = "created_at" if has_created_at else "''"
+        select_status = "status" if has_status else "'unchecked'"
+
+        # Legacy schema had NOT NULL items.position with no default.
+        # Rebuild table to current schema so inserts without position succeed.
+        self.connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS items_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'unchecked' CHECK(status IN ('checked', 'unchecked', 'deleted'))
+                )
+                """
+            )
+            self.connection.execute(
+                f"""
+                INSERT INTO items_new(id, trip_id, name, created_by, created_at, status)
+                SELECT id,
+                       trip_id,
+                       name,
+                       COALESCE({select_created_by}, 0),
+                       COALESCE({select_created_at}, ''),
+                       COALESCE({select_status}, 'unchecked')
+                FROM items
+                """
+            )
+            self.connection.execute("DROP TABLE items")
+            self.connection.execute("ALTER TABLE items_new RENAME TO items")
+        finally:
+            self.connection.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_sqlite_schema(self) -> None:
+        # Legacy DBs might miss recently-added columns. Add them before index creation.
+        self._rebuild_items_table_if_legacy_position()
+
+        if not self._sqlite_has_column("trips", "status"):
+            self.connection.execute("ALTER TABLE trips ADD COLUMN status TEXT NOT NULL DEFAULT 'packing'")
+        if not self._sqlite_has_column("trips", "created_by"):
+            self.connection.execute("ALTER TABLE trips ADD COLUMN created_by INTEGER NOT NULL DEFAULT 0")
+        if not self._sqlite_has_column("trips", "created_at"):
+            self.connection.execute("ALTER TABLE trips ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+
+        if not self._sqlite_has_column("items", "created_by"):
+            self.connection.execute("ALTER TABLE items ADD COLUMN created_by INTEGER NOT NULL DEFAULT 0")
+        if not self._sqlite_has_column("items", "created_at"):
+            self.connection.execute("ALTER TABLE items ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+        if not self._sqlite_has_column("items", "status"):
+            self.connection.execute("ALTER TABLE items ADD COLUMN status TEXT NOT NULL DEFAULT 'unchecked'")
+
+        if not self._sqlite_has_column("actions_history", "expires_at"):
+            self.connection.execute("ALTER TABLE actions_history ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''")
+
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                dirty INTEGER NOT NULL DEFAULT 0,
+                dirty_since TEXT,
+                last_local_action_at TEXT,
+                unsynced_actions INTEGER NOT NULL DEFAULT 0,
+                last_sync_started_at TEXT,
+                last_sync_completed_at TEXT,
+                last_sync_status TEXT,
+                last_error TEXT
+            )
+            """
+        )
+        self.connection.execute("INSERT OR IGNORE INTO sync_state(id, dirty, unsynced_actions) VALUES (1, 0, 0)")
 
     @property
     def is_postgres(self) -> bool:
@@ -193,6 +304,71 @@ class Database:
 
     def close(self) -> None:
         self.connection.close()
+
+    def mark_dirty_action(self) -> None:
+        timestamp = now_iso()
+        self.execute(
+            """
+            UPDATE sync_state
+            SET dirty=1,
+                dirty_since=COALESCE(dirty_since, ?),
+                last_local_action_at=?,
+                unsynced_actions=unsynced_actions+1
+            WHERE id=1
+            """,
+            (timestamp, timestamp),
+        )
+
+    def get_sync_state(self) -> dict[str, Any]:
+        row = self.fetchone("SELECT * FROM sync_state WHERE id=1")
+        if row is None:
+            return {
+                "id": 1,
+                "dirty": 0,
+                "dirty_since": None,
+                "last_local_action_at": None,
+                "unsynced_actions": 0,
+                "last_sync_started_at": None,
+                "last_sync_completed_at": None,
+                "last_sync_status": None,
+                "last_error": None,
+            }
+        return row
+
+    def mark_sync_started(self) -> None:
+        self.execute(
+            "UPDATE sync_state SET last_sync_started_at=?, last_error=NULL WHERE id=1",
+            (now_iso(),),
+        )
+
+    def mark_sync_succeeded(self) -> None:
+        timestamp = now_iso()
+        self.execute(
+            """
+            UPDATE sync_state
+            SET dirty=0,
+                dirty_since=NULL,
+                unsynced_actions=0,
+                last_sync_completed_at=?,
+                last_sync_status='ok',
+                last_error=NULL
+            WHERE id=1
+            """,
+            (timestamp,),
+        )
+
+    def mark_sync_failed(self, error_message: str) -> None:
+        timestamp = now_iso()
+        self.execute(
+            """
+            UPDATE sync_state
+            SET last_sync_completed_at=?,
+                last_sync_status='failed',
+                last_error=?
+            WHERE id=1
+            """,
+            (timestamp, error_message[:1000]),
+        )
 
 
 class SupabaseApiDatabase:
@@ -472,15 +648,36 @@ class SupabaseApiDatabase:
     def close(self) -> None:
         return
 
+    @staticmethod
+    def _chunk(rows: list[dict[str, Any]], size: int = 200) -> Iterator[list[dict[str, Any]]]:
+        for index in range(0, len(rows), size):
+            yield rows[index:index + size]
 
-def database_from_env() -> Database | SupabaseApiDatabase:
+    def upsert_snapshot(self, *, trips: list[dict[str, Any]], items: list[dict[str, Any]], actions: list[dict[str, Any]]) -> dict[str, int]:
+        sent = {"trips": 0, "items": 0, "actions": 0}
+        for batch in self._chunk(trips):
+            if batch:
+                self.client.table("trips").upsert(batch, on_conflict="id").execute()
+                sent["trips"] += len(batch)
+        for batch in self._chunk(items):
+            if batch:
+                self.client.table("items").upsert(batch, on_conflict="id").execute()
+                sent["items"] += len(batch)
+        for batch in self._chunk(actions):
+            if batch:
+                self.client.table("actions_history").upsert(batch, on_conflict="id").execute()
+                sent["actions"] += len(batch)
+        return sent
+
+
+def database_from_env() -> Database:
+    return Database(os.getenv("DATABASE_PATH", "packtogether.sqlite3"))
+
+
+def mirror_from_env() -> SupabaseApiDatabase | None:
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if supabase_url and supabase_service_role_key:
         return SupabaseApiDatabase(supabase_url, supabase_service_role_key)
 
-    dsn = os.getenv("SUPABASE_DB_URL")
-    if dsn:
-        return Database(dsn)
-
-    return Database(os.getenv("DATABASE_PATH", "packtogether.sqlite3"))
+    return None

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
 
-from .db import Database, now_iso
+from .db import Database, SupabaseApiDatabase, now_iso
 
 PAGE_SIZE = 8
 
@@ -60,6 +60,79 @@ class TripService:
             record["message_id"] = self._trip_message_ids.get(int(record["id"]))
         return record
 
+    @staticmethod
+    def _mirror_trip_payload(trip: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(trip["id"]),
+            "chat_id": int(trip["chat_id"]),
+            "name": str(trip["name"]),
+            "departure_at": str(trip["departure_at"]),
+            "status": str(trip["status"]),
+            "created_by": int(trip["created_by"]),
+            "created_at": str(trip["created_at"]),
+        }
+
+    @staticmethod
+    def _mirror_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(item["id"]),
+            "trip_id": int(item["trip_id"]),
+            "name": str(item["name"]),
+            "created_by": int(item["created_by"]),
+            "created_at": str(item["created_at"]),
+            "status": str(item["status"]),
+        }
+
+    @staticmethod
+    def _mirror_action_payload(action_row: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "id": int(action_row["id"]),
+            "trip_id": int(action_row["trip_id"]),
+            "type": str(action_row["type"]),
+            "desc": str(action_row["desc"]),
+            "actor": str(action_row["actor"]),
+            "timestamp": str(action_row["timestamp"]),
+            "expires_at": str(action_row["expires_at"]),
+        }
+        if action_row.get("item_id") is not None:
+            payload["item_id"] = int(action_row["item_id"])
+        return payload
+
+    def _mark_mutation(self) -> None:
+        self.db.mark_dirty_action()
+
+    def mirror_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        trips = [self._mirror_trip_payload(row) for row in self.db.fetchall("SELECT * FROM trips")]
+        items = [self._mirror_item_payload(row) for row in self.db.fetchall("SELECT * FROM items")]
+        actions = [
+            self._mirror_action_payload(row)
+            for row in self.db.fetchall('SELECT id, trip_id, item_id, type, "desc", actor, "timestamp", expires_at FROM actions_history')
+        ]
+        return {"trips": trips, "items": items, "actions": actions}
+
+    def sync_to_mirror(self, mirror: SupabaseApiDatabase) -> dict[str, Any]:
+        state_before = self.db.get_sync_state()
+        if not int(state_before.get("dirty") or 0):
+            return {"synced": False, "reason": "clean", "counts": {"trips": 0, "items": 0, "actions": 0}, "cleared": False}
+
+        marker = state_before.get("last_local_action_at")
+        self.db.mark_sync_started()
+        snapshot = self.mirror_snapshot()
+        counts = mirror.upsert_snapshot(trips=snapshot["trips"], items=snapshot["items"], actions=snapshot["actions"])
+
+        state_after = self.db.get_sync_state()
+        if state_after.get("last_local_action_at") == marker:
+            self.db.mark_sync_succeeded()
+            cleared = True
+        else:
+            self.db.execute(
+                "UPDATE sync_state SET last_sync_completed_at=?, last_sync_status='ok', last_error=NULL WHERE id=1",
+                (now_iso(),),
+            )
+            cleared = False
+
+        return {"synced": True, "reason": "ok", "counts": counts, "cleared": cleared}
+
     def create_trip(self, chat_id: int, name: str, departure_at: str, timezone_name: str, user_id: int, actor_display_name: str = "کاربر") -> int:
         del timezone_name
         if chat_id >= 0:
@@ -84,6 +157,7 @@ class TripService:
             except Exception as error:
                 raise TripError("این گروه در حال حاضر یک سفر فعال دارد.") from error
             self._record_activity(cx, trip_id, TRIP_CREATED, f"{actor_display_name.strip() or 'کاربر'} سفر «{name}» را ساخت.", actor_display_name)
+            self._mark_mutation()
             return int(trip_id)
 
     def _reconcile_chat(self, cx: Database, chat_id: int) -> None:
@@ -121,6 +195,7 @@ class TripService:
         if updated <= 0:
             return False
         self._record_activity(cx, int(trip["id"]), TRIP_LOCKED, f"{actor_display_name.strip() or 'کاربر'} سفر را شروع کرد و چک‌لیست را قفل کرد.", actor_display_name, user_id=user_id)
+        self._mark_mutation()
         return True
 
     def start_trip(self, trip_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
@@ -206,6 +281,7 @@ class TripService:
                 )
                 self._record_activity(cx, trip_id, ITEM_ADDED, f"{actor_display_name.strip() or 'کاربر'} آیتم «{name}» را اضافه کرد.", actor_display_name, item_id=item_id)
                 item_ids.append(int(item_id))
+            self._mark_mutation()
             return item_ids
 
     @staticmethod
@@ -254,6 +330,7 @@ class TripService:
             actor = (actor_display_name or display_name).strip() or "هم‌گروهی"
             desc = f"{actor.strip() or 'کاربر'} آیتم «{item['name']}» را {'تیک زد' if claimed else 'از حالت تیک خارج کرد'}."
             self._record_activity(cx, trip_id, action, desc, actor, item_id=item_id)
+            self._mark_mutation()
             return Change(item_id, claimed, duplicate_names)
 
     def delete_item(self, trip_id: int, item_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
@@ -288,6 +365,7 @@ class TripService:
                     actor_display_name,
                     item_id=item_id,
                 )
+            self._mark_mutation()
             return len(unique_ids)
 
     @staticmethod

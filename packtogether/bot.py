@@ -3,21 +3,23 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
+from telegram.request import HTTPXRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 if __package__:
     from .date_utils import TEHRAN, jalali_to_utc, validate_departure_date
-    from .db import database_from_env
+    from .db import mirror_from_env, database_from_env
     from .service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
     from .ui import render_activity_line, render_checklist
 else:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from packtogether.date_utils import TEHRAN, jalali_to_utc, validate_departure_date
-    from packtogether.db import database_from_env
+    from packtogether.db import mirror_from_env, database_from_env
     from packtogether.service import ITEM_ADDED, ITEM_CHECKED, ITEM_DELETED, ITEM_UNCHECKED, TRIP_CREATED, TRIP_LOCKED, Locked, NotFound, TripError, TripService
     from packtogether.ui import render_activity_line, render_checklist
 
@@ -25,19 +27,148 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 load_dotenv()
 
+SYNC_JOB_NAME = "mirror-sync"
+SYNC_IDLE_SECONDS = 30
+SYNC_MAX_UNSYNCED_ACTIONS = 150
+SYNC_MAX_DIRTY_AGE_SECONDS = 10 * 60
+
+
 def markup(rows):
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in rows])
+
 
 def cancel_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="setup_cancel")]])
 
+
 DATE_PROMPT = "📅 تاریخ حرکت سفر رو بفرست.\n\nمثال:\n1405.06.17"
 TIME_PROMPT = "🕐 ساعت حرکت رو بفرست.\n\nمثال:\n14:30"
+
+
+def _sync_log_level() -> str:
+    return (os.getenv("SYNC_LOG_LEVEL") or "normal").strip().lower()
+
+
+def _sync_log_verbose() -> bool:
+    return (os.getenv("SYNC_LOG_VERBOSE") or "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dev_id() -> int | None:
+    raw = (os.getenv("DEV_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("DEV_ID is not numeric: %s", raw)
+        return None
+
+
+def _allow_sync_log(kind: str) -> bool:
+    level = _sync_log_level()
+    if kind == "error":
+        return True
+    if level == "errors":
+        return False
+    if kind == "verbose":
+        return level == "verbose" or _sync_log_verbose()
+    return level in {"normal", "verbose"}
+
+
+async def _send_sync_log(application: Application, text: str, kind: str = "normal") -> None:
+    if not _allow_sync_log(kind):
+        return
+    dev_id = _dev_id()
+    if dev_id is None:
+        return
+    try:
+        await application.bot.send_message(chat_id=dev_id, text=text)
+    except Exception:
+        log.exception("failed to send sync log to DEV_ID")
+
+
+def _dirty_age_seconds(state: dict) -> int:
+    dirty_since = state.get("dirty_since")
+    if not dirty_since:
+        return 0
+    try:
+        ts = datetime.fromisoformat(str(dirty_since)).astimezone(timezone.utc)
+    except Exception:
+        return 0
+    return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+
+
+def _sync_delay_seconds(state: dict) -> int:
+    unsynced = int(state.get("unsynced_actions") or 0)
+    if unsynced >= SYNC_MAX_UNSYNCED_ACTIONS:
+        return 0
+    if _dirty_age_seconds(state) >= SYNC_MAX_DIRTY_AGE_SECONDS:
+        return 0
+    return SYNC_IDLE_SECONDS
+
+
+async def schedule_sync(application: Application, reason: str) -> None:
+    service = application.bot_data.get("service")
+    mirror = application.bot_data.get("mirror")
+    if not service or mirror is None:
+        return
+
+    state = service.db.get_sync_state()
+    if not int(state.get("dirty") or 0):
+        return
+
+    for job in application.job_queue.get_jobs_by_name(SYNC_JOB_NAME):
+        job.schedule_removal()
+
+    delay = _sync_delay_seconds(state)
+    application.job_queue.run_once(run_sync_job, when=delay, name=SYNC_JOB_NAME, data={"reason": reason})
+    await _send_sync_log(application, f"🛰️ Sync scheduled ({reason}) in {delay}s | unsynced={int(state.get('unsynced_actions') or 0)}", "verbose")
+
+
+async def run_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    application = context.application
+    service = application.bot_data.get("service")
+    mirror = application.bot_data.get("mirror")
+    if not service or mirror is None:
+        return
+
+    reason = (context.job.data or {}).get("reason", "unknown")
+    await _send_sync_log(application, f"🛰️ Sync started ({reason})", "verbose")
+    started = datetime.now(timezone.utc)
+
+    try:
+        result = service.sync_to_mirror(mirror)
+    except Exception as error:
+        service.db.mark_sync_failed(str(error))
+        log.exception("mirror sync failed")
+        await _send_sync_log(application, f"❌ Sync failed: {error}", "error")
+        context.application.job_queue.run_once(run_sync_job, when=60, name=SYNC_JOB_NAME, data={"reason": "retry-after-error"})
+        return
+
+    elapsed = int((datetime.now(timezone.utc) - started).total_seconds())
+    counts = result.get("counts", {})
+
+    if result.get("synced"):
+        await _send_sync_log(
+            application,
+            f"✅ Sync done in {elapsed}s | trips={counts.get('trips', 0)} items={counts.get('items', 0)} actions={counts.get('actions', 0)} | cleared={result.get('cleared')}",
+            "normal",
+        )
+
+    state = service.db.get_sync_state()
+    if int(state.get("dirty") or 0):
+        await schedule_sync(application, "post-sync-still-dirty")
+
+
+async def touch_local_mutation(context: ContextTypes.DEFAULT_TYPE, reason: str) -> None:
+    await schedule_sync(context.application, reason)
+
 
 async def show(update, service, trip, page=0, main_message=False):
     trip = service.trip_for_chat(trip["chat_id"])
     items, page, pages = service.page(trip["id"], page)
     text, rows = render_checklist(trip, items, page, pages, *service.progress(trip["id"]))
+
     async def send_checklist():
         message = await update.get_bot().send_message(trip["chat_id"], text, reply_markup=markup(rows))
         service.attach_message(trip["id"], message.message_id)
@@ -57,12 +188,14 @@ async def show(update, service, trip, page=0, main_message=False):
     else:
         await send_checklist()
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     try:
         await show(update, service, service.trip_for_chat(update.effective_chat.id))
     except NotFound:
         await update.effective_message.reply_text("سلام 👋\nبرای ساخت چک‌لیست سفر، دستور /newtrip رو داخل گروه بفرست.")
+
 
 async def new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
@@ -74,16 +207,20 @@ async def new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text("🧳 بزن بریم سفر جدید!\n\nاسم سفر رو وارد کن:", reply_markup=cancel_markup())
 
+
 async def private_new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("⚠️ برای ساخت سفر باید /newtrip رو داخل گروهی بفرستی که PackTogether اونجاست.")
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("راهنما ✨\nبرای ساخت چک‌لیست، داخل گروه دستور /newtrip رو بفرست.")
+
 
 async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
         await update.effective_message.reply_text("❌ ساخت سفر لغو شد. هر زمان خواستی دوباره /newtrip رو بزن.")
+
 
 def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now=None, actor_display_name: str = "هم‌گروهی") -> tuple[str, int | None]:
     setup = service.setup(chat_id, user_id)
@@ -104,7 +241,6 @@ def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now
         service.update_setup(chat_id, user_id, "time", departure_date=normalized_date)
         return TIME_PROMPT, None
     departure = jalali_to_utc(setup["departure_date"], text, TEHRAN)
-    from datetime import datetime, timezone
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         raise ValueError("Current time must be timezone-aware")
@@ -112,6 +248,7 @@ def setup_input(service: TripService, chat_id: int, user_id: int, text: str, now
         raise ValueError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً ساعت آینده‌ای را وارد کنید.")
     trip_id = service.complete_setup(chat_id, user_id, departure.isoformat(), actor_display_name)
     return "✅ سفر آماده شد! وقتشه وسایل رو تیک بزنید 🚀", trip_id
+
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
@@ -122,6 +259,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(response, reply_markup=cancel_markup() if not trip_id else None)
             if trip_id:
                 await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
+                await touch_local_mutation(context, "setup-complete")
         except (ValueError, TripError, NotFound) as error:
             prompt = DATE_PROMPT if setup["state"] == "date" else TIME_PROMPT if setup["state"] == "time" else None
             message = str(error)
@@ -133,9 +271,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if add_trip:
         try:
             service.add_items(add_trip, update.effective_message.text.splitlines(), update.effective_user.id, update.effective_user.first_name)
-            context.user_data.pop("add_item", None); await show(update, service, service.trip_for_chat(update.effective_chat.id))
+            context.user_data.pop("add_item", None)
+            await show(update, service, service.trip_for_chat(update.effective_chat.id))
+            await touch_local_mutation(context, "add-items")
         except (TripError, NotFound) as error:
             await update.effective_message.reply_text(str(error))
+
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -143,21 +284,28 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if query.data == "setup_cancel":
             if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
-                await query.answer(); await query.edit_message_text("❌ ساخت سفر لغو شد. هر زمان خواستی دوباره /newtrip رو بزن.")
+                await query.answer()
+                await query.edit_message_text("❌ ساخت سفر لغو شد. هر زمان خواستی دوباره /newtrip رو بزن.")
             else:
                 await query.answer("این جلسه دیگه فعال نیست.", show_alert=True)
             return
+
         kind, trip_id, *rest = query.data.split(":")
         trip = service.trip_for_chat(update.effective_chat.id)
-        if int(trip_id) != trip["id"]: raise NotFound("این چک‌لیست متعلق به این گروه نیست.")
+        if int(trip_id) != trip["id"]:
+            raise NotFound("این چک‌لیست متعلق به این گروه نیست.")
+
         if kind == "item":
             item_id = int(rest[0])
             if context.user_data.get("manage_trip") == trip["id"]:
                 item = service.db.fetchone("SELECT name FROM items WHERE id=? AND trip_id=? AND status <> 'deleted'", (item_id, trip["id"]))
-                if not item: raise NotFound("این مورد دیگر وجود ندارد.")
+                if not item:
+                    raise NotFound("این مورد دیگر وجود ندارد.")
                 selected = set(context.user_data.get("delete_items", []))
-                if item_id in selected: selected.remove(item_id)
-                else: selected.add(item_id)
+                if item_id in selected:
+                    selected.remove(item_id)
+                else:
+                    selected.add(item_id)
                 context.user_data["delete_items"] = list(selected)
                 await query.answer()
                 await render_manage(query, service, trip, context)
@@ -168,40 +316,59 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.answer()
             await show(update, service, trip)
+            await touch_local_mutation(context, "toggle-item")
         elif kind == "add":
-            context.user_data["add_item"] = trip["id"]; await query.answer(); await query.message.reply_text("➕ آیتم‌ها رو بفرست.\nهر مورد رو در یک خط جدا بنویس ✍️")
-        elif kind == "page": await query.answer(); await show(update, service, trip, int(rest[0]))
+            context.user_data["add_item"] = trip["id"]
+            await query.answer()
+            await query.message.reply_text("➕ آیتم‌ها رو بفرست.\nهر مورد رو در یک خط جدا بنویس ✍️")
+        elif kind == "page":
+            await query.answer()
+            await show(update, service, trip, int(rest[0]))
         elif kind == "confirm":
             item_ids = context.user_data.get("delete_items", [])
-            if not item_ids: raise NotFound("هیچ موردی برای حذف انتخاب نشده است.")
+            if not item_ids:
+                raise NotFound("هیچ موردی برای حذف انتخاب نشده است.")
             service.delete_items(trip["id"], item_ids, update.effective_user.id, update.effective_user.first_name)
-            context.user_data.pop("delete_items", None); context.user_data.pop("manage_trip", None)
+            context.user_data.pop("delete_items", None)
+            context.user_data.pop("manage_trip", None)
             await query.answer()
             await query.message.delete()
             await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
+            await touch_local_mutation(context, "delete-items")
         elif kind == "cancel":
-            context.user_data.pop("delete_items", None); context.user_data.pop("manage_trip", None)
+            context.user_data.pop("delete_items", None)
+            context.user_data.pop("manage_trip", None)
             await query.answer()
             await query.edit_message_text("↩️ حذف لغو شد.")
         elif kind == "start":
             await query.answer()
-            await query.edit_message_text("🚀 شروع فوری سفر\n\nبعد از شروع، افزودن، تیک‌زدن و حذف آیتم‌ها ممکن نیست.", reply_markup=markup([[("✅ بله، سفر را شروع کن", f"start_confirm:{trip['id']}"), ("↩️ لغو", f"cancel:{trip['id']}")]]))
+            await query.edit_message_text(
+                "🚀 شروع فوری سفر\n\nبعد از شروع، افزودن، تیک‌زدن و حذف آیتم‌ها ممکن نیست.",
+                reply_markup=markup([[("✅ بله، سفر را شروع کن", f"start_confirm:{trip['id']}"), ("↩️ لغو", f"cancel:{trip['id']}")]]),
+            )
         elif kind == "start_confirm":
             service.start_trip(trip["id"], update.effective_user.id, update.effective_user.first_name)
             await query.answer()
             await query.message.delete()
             await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
+            await touch_local_mutation(context, "start-trip")
         elif kind == "activity":
             lines = ["🕓 فعالیت‌های اخیر", ""]
             lines.extend(render_activity_line(trip["name"], row) for row in service.activities(trip["id"]))
-            await query.answer(); await query.message.reply_text("\n".join(lines))
+            await query.answer()
+            await query.message.reply_text("\n".join(lines))
         elif kind == "manage":
             context.user_data["manage_trip"] = trip["id"]
             context.user_data["delete_items"] = []
-            await query.answer(); await render_manage(query, service, trip, context)
-    except Locked: await query.answer("🔒 این سفر شروع شده و چک‌لیست قفل است.", show_alert=True)
-    except (TripError, ValueError) as error: await query.answer(str(error), show_alert=True)
-    except Exception: log.exception("callback failed")
+            await query.answer()
+            await render_manage(query, service, trip, context)
+    except Locked:
+        await query.answer("🔒 این سفر شروع شده و چک‌لیست قفل است.", show_alert=True)
+    except (TripError, ValueError) as error:
+        await query.answer(str(error), show_alert=True)
+    except Exception:
+        log.exception("callback failed")
+
 
 async def render_manage(query, service, trip, context):
     items, _, _ = service.page(trip["id"])
@@ -215,20 +382,56 @@ async def render_manage(query, service, trip, context):
         text += f"\n\n✅ {len(selected)} مورد انتخاب شده"
     await query.edit_message_text(text, reply_markup=markup(rows))
 
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("update handling failed", exc_info=context.error)
+
+
 def build_application() -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token or token == "replace-with-botfather-token":
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Set it in .env or export it before starting the bot.")
-    application = Application.builder().token(token).post_init(set_command_menus).build()
+    # Prevent inheriting system proxy settings for Telegram polling/session traffic.
+    # Misconfigured proxy chains can cause intermittent RemoteProtocolError disconnects.
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=10.0,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        pool_timeout=5.0,
+        httpx_kwargs={"trust_env": False},
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=10.0,
+        read_timeout=35.0,
+        write_timeout=20.0,
+        pool_timeout=5.0,
+        httpx_kwargs={"trust_env": False},
+    )
+
+    application = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .post_init(set_command_menus)
+        .build()
+    )
     application.bot_data["service"] = TripService(database_from_env())
+    application.bot_data["mirror"] = mirror_from_env()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("newtrip", new_trip, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("newtrip", private_new_trip, filters=filters.ChatType.PRIVATE))
-    application.add_handler(CallbackQueryHandler(callback)); application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
+    application.add_handler(CallbackQueryHandler(callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     application.add_error_handler(on_error)
+
     application.job_queue.run_repeating(lock_due_trips, interval=30, first=5)
     return application
+
 
 async def set_command_menus(application: Application) -> None:
     await application.bot.set_my_commands(
@@ -240,6 +443,15 @@ async def set_command_menus(application: Application) -> None:
         scope=BotCommandScopeAllGroupChats(),
     )
 
+    service = application.bot_data.get("service")
+    mirror = application.bot_data.get("mirror")
+    if service and mirror:
+        state = service.db.get_sync_state()
+        if int(state.get("dirty") or 0):
+            await _send_sync_log(application, "🛰️ Startup found pending local changes. Scheduling sync.", "normal")
+            await schedule_sync(application, "startup-pending")
+
+
 async def lock_due_trips(context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     for trip in service.due_trips():
@@ -249,11 +461,10 @@ async def lock_due_trips(context: ContextTypes.DEFAULT_TYPE):
                 items, page, pages = service.page(trip["id"])
                 text, rows = render_checklist(locked_trip, items, page, pages, *service.progress(trip["id"]))
                 await context.bot.edit_message_text(text, chat_id=trip["chat_id"], message_id=trip["message_id"], reply_markup=markup(rows))
+                await touch_local_mutation(context, "auto-lock-due-trip")
         except Exception:
             log.exception("scheduled trip lock failed for %s", trip["id"])
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("update handling failed", exc_info=context.error)
-
-if __name__ == "__main__": build_application().run_polling()
+if __name__ == "__main__":
+    build_application().run_polling()

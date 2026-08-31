@@ -13,8 +13,11 @@ PackTogether is a Persian-first collaborative Telegram packing checklist. It kee
 	pip install -r requirements.txt
 	```
 
-3. Copy `.env.example` to `.env`, set `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY`.
-   Optional alternatives: `SUPABASE_DB_URL` (direct Postgres DSN) or `DATABASE_PATH` (local SQLite fallback).
+3. Copy `.env.example` to `.env` and set:
+   - `TELEGRAM_BOT_TOKEN`
+   - `DATABASE_PATH` (local SQLite, primary runtime store)
+   - Optional mirror: `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`
+   - Optional sync telemetry: `DEV_ID`, `SYNC_LOG_LEVEL`, `SYNC_LOG_VERBOSE`.
 4. Run the bot:
 
 	```bash
@@ -30,6 +33,6 @@ Departure timestamps are stored as UTC ISO-8601 values after converting the supp
 
 ## Tests and architecture
 
-Run `python3 -m pytest -q`. `packtogether/db.py` owns database connectivity (Supabase via `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, optional direct PostgreSQL DSN via `SUPABASE_DB_URL`, with SQLite fallback), `service.py` contains language-independent domain operations, `ui.py` renders the Persian checklist, and `bot.py` is the Telegram adapter.
+Run `python3 -m pytest -q`. `packtogether/db.py` owns local SQLite + optional Supabase mirror connectivity, `service.py` contains language-independent domain operations, `ui.py` renders the Persian checklist, and `bot.py` is the Telegram adapter. Writes are local-first and mirrored to Supabase after 30s inactivity (with safety triggers).
 
-For deployment, run the polling process under a supervisor such as systemd, Docker, or a managed worker. The included `Dockerfile` starts the bot with `python -m packtogether.bot`. Set `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY` in the deployment environment. The bot only uses `/start` and `/newtrip`; the normal workflow is inline buttons.
+For deployment, run the polling process under a supervisor such as systemd, Docker, or a managed worker. The included `Dockerfile` starts the bot with `python -m packtogether.bot`. Set `TELEGRAM_BOT_TOKEN` and `DATABASE_PATH`; add `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` if you want background mirroring to Supabase. Add `DEV_ID` if you want sync logs in Telegram DM. The bot only uses `/start` and `/newtrip`; the normal workflow is inline buttons.
