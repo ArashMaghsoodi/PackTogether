@@ -13,10 +13,8 @@ create table if not exists public.trips (
   created_at timestamptz not null default now()
 );
 
--- Only one active trip per group/chat.
-create unique index if not exists trips_one_active_per_chat
-  on public.trips (chat_id)
-  where status = 'packing';
+-- Multi-trip model: active-trip limit is enforced in service logic.
+drop index if exists public.trips_one_active_per_chat;
 
 create index if not exists trips_chat_id_idx on public.trips (chat_id);
 create index if not exists trips_created_at_idx on public.trips (created_at desc);

@@ -87,6 +87,21 @@ def test_setup_lifecycle_in_memory():
     assert app_service.setup(-30, 7)["trip_name"] == "سفر کویر"
 
 
+def test_setup_session_persists_across_service_restart(tmp_path):
+    path = tmp_path / "persist-setup.sqlite3"
+    first = service(path)
+    assert first.begin_setup(-300, 9)
+    setup_input(first, -300, 9, "سفر پایدار")
+    assert first.setup(-300, 9)["state"] == "date"
+    first.db.close()
+
+    second = service(path)
+    restored = second.setup(-300, 9)
+    assert restored is not None
+    assert restored["trip_name"] == "سفر پایدار"
+    assert restored["state"] == "date"
+
+
 def test_past_departure_is_rejected_without_creating_trip():
     app_service = service()
     app_service.begin_setup(-40, 1)

@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_error TEXT
 );
 INSERT OR IGNORE INTO sync_state(id, dirty, unsynced_actions) VALUES (1, 0, 0);
+
+CREATE TABLE IF NOT EXISTS setup_sessions (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    trip_name TEXT,
+    departure_date TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 """
 
 
@@ -113,6 +123,16 @@ CREATE TABLE IF NOT EXISTS public.actions_history (
 CREATE INDEX IF NOT EXISTS actions_history_trip_id_idx ON public.actions_history (trip_id);
 CREATE INDEX IF NOT EXISTS actions_history_timestamp_idx ON public.actions_history ("timestamp" DESC);
 CREATE INDEX IF NOT EXISTS actions_history_expires_at_idx ON public.actions_history (expires_at);
+
+CREATE TABLE IF NOT EXISTS public.setup_sessions (
+  chat_id bigint not null,
+  user_id bigint not null,
+  state text not null,
+  trip_name text,
+  departure_date text,
+  updated_at timestamptz not null default now(),
+  primary key (chat_id, user_id)
+);
 """
 
 
@@ -250,6 +270,19 @@ class Database:
             """
         )
         self.connection.execute("INSERT OR IGNORE INTO sync_state(id, dirty, unsynced_actions) VALUES (1, 0, 0)")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS setup_sessions (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                trip_name TEXT,
+                departure_date TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )
+            """
+        )
 
     @property
     def is_postgres(self) -> bool:

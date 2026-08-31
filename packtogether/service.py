@@ -24,6 +24,8 @@ class Locked(TripError):
 
 
 TRIP_CREATED = "trip_created"
+TRIP_UPDATED = "trip_updated"
+TRIP_DELETED = "trip_deleted"
 ITEM_ADDED = "item_added"
 ITEM_CHECKED = "item_checked"
 ITEM_UNCHECKED = "item_unchecked"
@@ -41,7 +43,6 @@ class Change:
 class TripService:
     def __init__(self, db: Database):
         self.db = db
-        self._setup_sessions: dict[tuple[int, int], dict[str, str | None]] = {}
         self._setup_lock = RLock()
         self._trip_message_ids: dict[int, int] = {}
         self._message_lock = RLock()
@@ -103,11 +104,15 @@ class TripService:
         self.db.mark_dirty_action()
 
     def mirror_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        now = datetime.now(timezone.utc).isoformat()
         trips = [self._mirror_trip_payload(row) for row in self.db.fetchall("SELECT * FROM trips")]
         items = [self._mirror_item_payload(row) for row in self.db.fetchall("SELECT * FROM items")]
         actions = [
             self._mirror_action_payload(row)
-            for row in self.db.fetchall('SELECT id, trip_id, item_id, type, "desc", actor, "timestamp", expires_at FROM actions_history')
+            for row in self.db.fetchall(
+                'SELECT id, trip_id, item_id, type, "desc", actor, "timestamp", expires_at FROM actions_history WHERE expires_at > ?',
+                (now,),
+            )
         ]
         return {"trips": trips, "items": items, "actions": actions}
 
@@ -173,14 +178,14 @@ class TripService:
 
     def trips_for_chat(self, chat_id: int) -> list[Any]:
         rows = self.db.fetchall(
-            "SELECT * FROM trips WHERE chat_id=? ORDER BY CASE WHEN status='packing' THEN 0 ELSE 1 END, departure_at DESC, id DESC",
+            "SELECT * FROM trips WHERE chat_id=? ORDER BY CASE WHEN status='packing' THEN 0 ELSE 1 END, created_at DESC, id DESC",
             (chat_id,),
         )
         return [self._with_message(row) for row in rows]
 
     def trip_for_chat(self, chat_id: int) -> Any:
         trip = self.db.fetchone(
-            "SELECT * FROM trips WHERE chat_id=? ORDER BY CASE WHEN status='packing' THEN 0 ELSE 1 END, departure_at DESC, id DESC LIMIT 1",
+            "SELECT * FROM trips WHERE chat_id=? ORDER BY CASE WHEN status='packing' THEN 0 ELSE 1 END, created_at DESC, id DESC LIMIT 1",
             (chat_id,),
         )
         if not trip:
@@ -245,32 +250,43 @@ class TripService:
         return due
 
     def setup(self, chat_id: int, user_id: int) -> Any:
-        with self._setup_lock:
-            session = self._setup_sessions.get((chat_id, user_id))
-            return dict(session) if session else None
+        row = self.db.fetchone(
+            "SELECT state, trip_name, departure_date FROM setup_sessions WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        )
+        return dict(row) if row else None
 
     def begin_setup(self, chat_id: int, user_id: int) -> bool:
         with self._setup_lock:
             key = (chat_id, user_id)
-            if key in self._setup_sessions:
+            existing = self.db.fetchone("SELECT 1 AS ok FROM setup_sessions WHERE chat_id=? AND user_id=?", key)
+            if existing:
                 return False
-            self._setup_sessions[key] = {"state": "name", "trip_name": None, "departure_date": None}
+            self.db.execute(
+                "INSERT INTO setup_sessions(chat_id,user_id,state,trip_name,departure_date,updated_at) VALUES(?,?,?,?,?,?)",
+                (chat_id, user_id, "name", None, None, now_iso()),
+            )
             return True
 
     def update_setup(self, chat_id: int, user_id: int, state: str, *, trip_name: str | None = None, departure_date: str | None = None) -> None:
         with self._setup_lock:
             key = (chat_id, user_id)
-            if key not in self._setup_sessions:
+            current = self.db.fetchone(
+                "SELECT state, trip_name, departure_date FROM setup_sessions WHERE chat_id=? AND user_id=?",
+                key,
+            )
+            if not current:
                 return
-            self._setup_sessions[key]["state"] = state
-            if trip_name is not None:
-                self._setup_sessions[key]["trip_name"] = trip_name
-            if departure_date is not None:
-                self._setup_sessions[key]["departure_date"] = departure_date
+            next_trip_name = current.get("trip_name") if trip_name is None else trip_name
+            next_departure_date = current.get("departure_date") if departure_date is None else departure_date
+            self.db.execute(
+                "UPDATE setup_sessions SET state=?, trip_name=?, departure_date=?, updated_at=? WHERE chat_id=? AND user_id=?",
+                (state, next_trip_name, next_departure_date, now_iso(), chat_id, user_id),
+            )
 
     def cancel_setup(self, chat_id: int, user_id: int) -> bool:
         with self._setup_lock:
-            return self._setup_sessions.pop((chat_id, user_id), None) is not None
+            return self.db.execute("DELETE FROM setup_sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id)) > 0
 
     def complete_setup(self, chat_id: int, user_id: int, departure_at: str, actor_display_name: str = "کاربر") -> int:
         setup = self.setup(chat_id, user_id)
@@ -373,7 +389,7 @@ class TripService:
             self._record_activity(
                 cx,
                 int(trip_id),
-                TRIP_CREATED,
+                TRIP_UPDATED,
                 f"{(actor_display_name or 'کاربر').strip() or 'کاربر'} سفر «{next_name}» را ویرایش کرد.",
                 actor_display_name,
             )
@@ -386,7 +402,7 @@ class TripService:
             trip = cx.fetchone("SELECT * FROM trips WHERE id=?", (trip_id,))
             if not trip:
                 raise NotFound("سفر پیدا نشد.")
-            self._record_activity(cx, trip_id, TRIP_CREATED, f"{actor_display_name.strip() or 'کاربر'} سفر «{trip['name']}» را حذف کرد.", actor_display_name)
+            self._record_activity(cx, trip_id, TRIP_DELETED, f"{actor_display_name.strip() or 'کاربر'} سفر «{trip['name']}» را حذف کرد.", actor_display_name)
             cx.execute("DELETE FROM trips WHERE id=?", (trip_id,))
             self._mark_mutation()
 

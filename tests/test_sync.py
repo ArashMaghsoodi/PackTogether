@@ -59,6 +59,23 @@ def test_sync_to_mirror_noop_when_clean():
     assert mirror.calls == []
 
 
+def test_sync_to_mirror_excludes_expired_actions():
+    s = service()
+    t = trip(s)
+    s.add_item(t, "چادر", 1, "آرش")
+    s.db.execute(
+        'UPDATE actions_history SET expires_at=? WHERE trip_id=?',
+        ("2000-01-01T00:00:00+00:00", t),
+    )
+    mirror = MirrorStub()
+    result = s.sync_to_mirror(mirror)
+    assert result["synced"]
+    sent_trips, sent_items, sent_actions = mirror.calls[0]
+    assert sent_trips
+    assert sent_items
+    assert sent_actions == []
+
+
 def test_legacy_items_position_column_is_migrated(tmp_path):
     db_path = tmp_path / "legacy.sqlite3"
     conn = sqlite3.connect(db_path)

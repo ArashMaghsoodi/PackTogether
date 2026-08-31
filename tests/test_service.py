@@ -151,3 +151,35 @@ def test_delete_trip_does_not_fail_when_recording_activity():
     s.delete_trip(t, 1, "آرش")
     with pytest.raises(NotFound):
         s.trip_by_id(t)
+
+
+def test_update_trip_records_trip_updated_action_type():
+    s = service(); now = datetime.now(timezone.utc)
+    trip_id = s.create_trip(-300, "سفر قدیم", (now + timedelta(days=2)).isoformat(), "Asia/Tehran", 1, "آرش")
+    s.update_trip(trip_id, "سفر جدید", (now + timedelta(days=3)).isoformat(), "مریم")
+
+    rows = s.db.fetchall('SELECT type, "desc" FROM actions_history WHERE trip_id=? ORDER BY id', (trip_id,))
+    assert [row["type"] for row in rows] == ["trip_created", "trip_updated"]
+    assert "ویرایش" in rows[1]["desc"]
+
+
+def test_delete_trip_records_trip_deleted_action_type(monkeypatch):
+    s = service(); t = trip(s)
+    captured = []
+    original = TripService._record_activity
+
+    def capture(cx, trip_id, action, desc, actor_name, item_id=None, *, user_id=0):
+        captured.append(action)
+        return original(cx, trip_id, action, desc, actor_name, item_id=item_id, user_id=user_id)
+
+    monkeypatch.setattr(TripService, "_record_activity", staticmethod(capture))
+    s.delete_trip(t, 1, "آرش")
+    assert captured[-1] == "trip_deleted"
+
+
+def test_trips_for_chat_orders_newest_first_within_status_bucket():
+    s = service(); now = datetime.now(timezone.utc)
+    older = s.create_trip(-400, "قدیمی", (now + timedelta(days=5)).isoformat(), "Asia/Tehran", 1)
+    newer = s.create_trip(-400, "جدید", (now + timedelta(days=1)).isoformat(), "Asia/Tehran", 1)
+    rows = s.trips_for_chat(-400)
+    assert [row["id"] for row in rows[:2]] == [newer, older]

@@ -341,6 +341,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("این جلسه دیگه فعال نیست.", show_alert=True)
             return
 
+        if query.data == "noop":
+            await query.answer()
+            return
+
         kind, trip_id, *rest = query.data.split(":")
         trip = service.trip_by_id(int(trip_id))
         if trip["chat_id"] != update.effective_chat.id:
@@ -388,16 +392,22 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.delete()
             await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
             await touch_local_mutation(context, "delete-items")
-        elif kind == "cancel":
+        elif kind == "cancel_manage":
             context.user_data.pop("delete_items", None)
             context.user_data.pop("manage_trip", None)
             await query.answer()
             await query.edit_message_text("↩️ حذف لغو شد.")
+        elif kind == "cancel_start":
+            await query.answer()
+            await query.edit_message_text("↩️ شروع فوری سفر لغو شد.")
+        elif kind == "cancel_delete_trip":
+            await query.answer()
+            await query.edit_message_text("↩️ حذف سفر لغو شد.")
         elif kind == "start":
             await query.answer()
             await query.edit_message_text(
                 "🚀 شروع فوری سفر\n\nبعد از شروع، افزودن، تیک‌زدن و حذف آیتم‌ها ممکن نیست.",
-                reply_markup=markup([[("✅ بله، سفر را شروع کن", f"start_confirm:{trip['id']}"), ("↩️ لغو", f"cancel:{trip['id']}")]]),
+                reply_markup=markup([[("✅ بله، سفر را شروع کن", f"start_confirm:{trip['id']}"), ("↩️ لغو", f"cancel_start:{trip['id']}")]]),
             )
         elif kind == "start_confirm":
             service.start_trip(trip["id"], update.effective_user.id, update.effective_user.first_name)
@@ -423,7 +433,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             await query.edit_message_text(
                 "🗑️ حذف سفر\n\nاین سفر حذف می‌شود. مطمئن هستی؟",
-                reply_markup=markup([[("✅ بله، حذف کن", f"delete_trip_confirm:{trip['id']}"), ("↩️ لغو", f"cancel:{trip['id']}")]]),
+                reply_markup=markup([[("✅ بله، حذف کن", f"delete_trip_confirm:{trip['id']}"), ("↩️ لغو", f"cancel_delete_trip:{trip['id']}")]]),
             )
         elif kind == "delete_trip_confirm":
             service.delete_trip(trip["id"], update.effective_user.id, update.effective_user.first_name)
@@ -441,16 +451,20 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (TripError, ValueError) as error:
         await query.answer(str(error), show_alert=True)
     except Exception:
+        await query.answer("⚠️ خطایی رخ داد. دوباره تلاش کنید.", show_alert=True)
         log.exception("callback failed")
 
 
 async def render_manage(query, service, trip, context):
-    items, _, _ = service.page(trip["id"])
+    items = service.db.fetchall(
+        "SELECT id, trip_id, name, created_by, created_at, status FROM items WHERE trip_id=? AND status <> 'deleted' ORDER BY id",
+        (trip["id"],),
+    )
     selected = set(context.user_data.get("delete_items", []))
     rows = [[(f"{'✅' if item['id'] in selected else '⬜️'} {item['name']}", f"item:{trip['id']}:{item['id']}")] for item in items]
     if selected:
         rows.append([("🗑️ حذف موارد انتخاب‌شده", f"confirm:{trip['id']}")])
-    rows.append([("↩️ خروج از مدیریت", f"cancel:{trip['id']}")])
+    rows.append([("↩️ خروج از مدیریت", f"cancel_manage:{trip['id']}")])
     text = "🗂 حالت مدیریت آیتم‌ها\n\nمواردی را که می‌خواهی حذف شوند انتخاب کن."
     if selected:
         text += f"\n\n✅ {len(selected)} مورد انتخاب شده"
