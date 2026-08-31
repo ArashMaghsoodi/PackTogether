@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from packtogether.db import Database
-from packtogether.service import Locked, NotFound, TripService
+from packtogether.service import Locked, NotFound, TripError, TripService
 from packtogether.ui import render_activity_line
 
 
@@ -123,5 +123,31 @@ def test_trip_status_history_lists_each_trip_with_status_label():
         (-200, "سفر تبریز", (now + timedelta(days=2)).isoformat(), "packing", 1, now.isoformat()),
     )
     history = s.trip_status_history(-200)
-    assert [line for line, _ in history] == ["سفر شمال", "سفر تبریز"]
-    assert [status for _, status in history] == ["شروع و قفل شده", "هنوز شروع نشده"]
+    assert [line for line, _ in history] == ["سفر تبریز", "سفر شمال"]
+    assert [status for _, status in history] == ["هنوز شروع نشده", "شروع و قفل شده"]
+
+
+def test_group_allows_up_to_three_active_trips():
+    s = service(); now = datetime.now(timezone.utc)
+    for index in range(3):
+        trip_id = s.create_trip(-202, f"سفر {index + 1}", (now + timedelta(days=index + 1)).isoformat(), "Asia/Tehran", 1)
+        assert trip_id > 0
+    with pytest.raises(TripError):
+        s.create_trip(-202, "سفر 4", (now + timedelta(days=10)).isoformat(), "Asia/Tehran", 1)
+
+
+def test_update_trip_changes_name_and_departure_time():
+    s = service(); now = datetime.now(timezone.utc)
+    trip_id = s.create_trip(-203, "سفر شمال", (now + timedelta(days=2)).isoformat(), "Asia/Tehran", 1)
+    updated = s.update_trip(trip_id, "سفر تبریز", (now + timedelta(days=5)).isoformat())
+    assert updated == trip_id
+    trip = s.trip_by_id(trip_id)
+    assert trip["name"] == "سفر تبریز"
+    assert trip["departure_at"] == (now + timedelta(days=5)).isoformat()
+
+
+def test_delete_trip_does_not_fail_when_recording_activity():
+    s = service(); t = trip(s)
+    s.delete_trip(t, 1, "آرش")
+    with pytest.raises(NotFound):
+        s.trip_by_id(t)

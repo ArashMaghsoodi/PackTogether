@@ -60,7 +60,7 @@ INSERT OR IGNORE INTO sync_state(id, dirty, unsynced_actions) VALUES (1, 0, 0);
 
 
 SQLITE_INDEXES = """
-CREATE UNIQUE INDEX IF NOT EXISTS trips_one_active_per_chat ON trips(chat_id) WHERE status='packing';
+DROP INDEX IF EXISTS trips_one_active_per_chat;
 CREATE INDEX IF NOT EXISTS trips_chat_id_idx ON trips(chat_id);
 CREATE INDEX IF NOT EXISTS trips_created_at_idx ON trips(created_at DESC);
 CREATE INDEX IF NOT EXISTS trips_departure_at_idx ON trips(departure_at);
@@ -83,9 +83,7 @@ CREATE TABLE IF NOT EXISTS public.trips (
   created_by bigint not null,
   created_at timestamptz not null default now()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS trips_one_active_per_chat
-  ON public.trips (chat_id)
-  WHERE status = 'packing';
+DROP INDEX IF EXISTS public.trips_one_active_per_chat;
 CREATE INDEX IF NOT EXISTS trips_chat_id_idx ON public.trips (chat_id);
 CREATE INDEX IF NOT EXISTS trips_created_at_idx ON public.trips (created_at DESC);
 CREATE INDEX IF NOT EXISTS trips_departure_at_idx ON public.trips (departure_at);
@@ -216,6 +214,25 @@ class Database:
 
         if not self._sqlite_has_column("actions_history", "expires_at"):
             self.connection.execute("ALTER TABLE actions_history ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''")
+
+        # Older databases could contain trips that were still "packing" before the auto-lock
+        # background job existed. Treat any trip already due as locked so it does not block
+        # a fresh group from creating a new active trip.
+        for trip in self.connection.execute("SELECT id, departure_at, status FROM trips").fetchall():
+            trip_id = int(trip[0])
+            departure_at = str(trip[1])
+            current_status = str(trip[2])
+            if current_status == "locked":
+                continue
+            try:
+                departure = datetime.fromisoformat(departure_at)
+            except ValueError:
+                continue
+            if departure.tzinfo is None:
+                departure = departure.replace(tzinfo=timezone.utc)
+            new_status = "locked" if departure.astimezone(timezone.utc) <= datetime.now(timezone.utc) else "packing"
+            if current_status != new_status:
+                self.connection.execute("UPDATE trips SET status=? WHERE id=?", (new_status, trip_id))
 
         self.connection.execute(
             """

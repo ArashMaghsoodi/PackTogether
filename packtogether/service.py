@@ -8,6 +8,7 @@ from typing import Any
 from .db import Database, SupabaseApiDatabase, now_iso
 
 PAGE_SIZE = 8
+MAX_ACTIVE_TRIPS_PER_CHAT = 3
 
 
 class TripError(Exception):
@@ -146,16 +147,16 @@ class TripService:
             raise TripError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً تاریخ و ساعت آینده‌ای را وارد کنید.")
         with self.db.transaction() as cx:
             self._reconcile_chat(cx, chat_id)
-            existing = cx.fetchone("SELECT id FROM trips WHERE chat_id=? AND status='packing'", (chat_id,))
-            if existing:
-                raise TripError("این گروه از قبل یک سفر فعال دارد.")
+            active_count = int(cx.scalar("SELECT COUNT(*) FROM trips WHERE chat_id=? AND status='packing'", (chat_id,)) or 0)
+            if active_count >= MAX_ACTIVE_TRIPS_PER_CHAT:
+                raise TripError("این گروه حداکثر ۳ سفر فعال می‌تواند داشته باشد.")
             try:
                 trip_id = cx.insert_returning_id(
                     "INSERT INTO trips(chat_id,name,departure_at,status,created_by,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
                     (chat_id, name, departure_iso, "packing", user_id, now_iso()),
                 )
             except Exception as error:
-                raise TripError("این گروه در حال حاضر یک سفر فعال دارد.") from error
+                raise TripError("این گروه در حال حاضر بیشترین تعداد سفرهای فعال را دارد.") from error
             self._record_activity(cx, trip_id, TRIP_CREATED, f"{actor_display_name.strip() or 'کاربر'} سفر «{name}» را ساخت.", actor_display_name)
             self._mark_mutation()
             return int(trip_id)
@@ -164,17 +165,37 @@ class TripService:
         for trip in cx.fetchall("SELECT * FROM trips WHERE chat_id=? AND status='packing'", (chat_id,)):
             self._lock_if_due(cx, trip)
 
+    def trip_by_id(self, trip_id: int) -> Any:
+        trip = self.db.fetchone("SELECT * FROM trips WHERE id=?", (trip_id,))
+        if not trip:
+            raise NotFound("سفر پیدا نشد.")
+        return self._with_message(trip)
+
+    def trips_for_chat(self, chat_id: int) -> list[Any]:
+        rows = self.db.fetchall(
+            "SELECT * FROM trips WHERE chat_id=? ORDER BY CASE WHEN status='packing' THEN 0 ELSE 1 END, departure_at DESC, id DESC",
+            (chat_id,),
+        )
+        return [self._with_message(row) for row in rows]
+
     def trip_for_chat(self, chat_id: int) -> Any:
-        trip = self.db.fetchone("SELECT * FROM trips WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,))
+        trip = self.db.fetchone(
+            "SELECT * FROM trips WHERE chat_id=? ORDER BY CASE WHEN status='packing' THEN 0 ELSE 1 END, departure_at DESC, id DESC LIMIT 1",
+            (chat_id,),
+        )
         if not trip:
             raise NotFound("هنوز چک‌لیستی ساخته نشده است.")
         return self._with_message(trip)
 
     def active_trip(self, chat_id: int) -> Any:
+        trips = self.active_trips(chat_id)
+        return trips[0] if trips else None
+
+    def active_trips(self, chat_id: int) -> list[Any]:
         with self.db.transaction() as cx:
             self._reconcile_chat(cx, chat_id)
-            trip = cx.fetchone("SELECT * FROM trips WHERE chat_id=? AND status='packing' ORDER BY id DESC LIMIT 1", (chat_id,))
-        return self._with_message(trip)
+            rows = cx.fetchall("SELECT * FROM trips WHERE chat_id=? AND status='packing' ORDER BY departure_at DESC, id DESC", (chat_id,))
+        return [self._with_message(row) for row in rows]
 
     def attach_message(self, trip_id: int, message_id: int) -> None:
         with self._message_lock:
@@ -333,6 +354,42 @@ class TripService:
             self._mark_mutation()
             return Change(item_id, claimed, duplicate_names)
 
+    def update_trip(self, trip_id: int, name: str | None = None, departure_at: str | None = None, actor_display_name: str = "کاربر") -> int:
+        with self.db.transaction() as cx:
+            trip = cx.fetchone("SELECT * FROM trips WHERE id=?", (trip_id,))
+            if not trip:
+                raise NotFound("سفر پیدا نشد.")
+            next_name = str(trip["name"]) if name is None else name.strip()
+            if not next_name or len(next_name) > 80:
+                raise TripError("نام سفر باید بین ۱ تا ۸۰ نویسه باشد.")
+            next_departure = str(trip["departure_at"]) if departure_at is None else self._to_utc_iso(departure_at)
+            departure = datetime.fromisoformat(next_departure)
+            if departure <= datetime.now(timezone.utc):
+                raise TripError("❌ زمان حرکت نمی‌تواند در گذشته باشد.\n\nلطفاً تاریخ و ساعت آینده‌ای را وارد کنید.")
+            cx.execute(
+                "UPDATE trips SET name=?, departure_at=? WHERE id=?",
+                (next_name, next_departure, int(trip_id)),
+            )
+            self._record_activity(
+                cx,
+                int(trip_id),
+                TRIP_CREATED,
+                f"{(actor_display_name or 'کاربر').strip() or 'کاربر'} سفر «{next_name}» را ویرایش کرد.",
+                actor_display_name,
+            )
+            self._mark_mutation()
+            return int(trip_id)
+
+    def delete_trip(self, trip_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
+        del user_id
+        with self.db.transaction() as cx:
+            trip = cx.fetchone("SELECT * FROM trips WHERE id=?", (trip_id,))
+            if not trip:
+                raise NotFound("سفر پیدا نشد.")
+            self._record_activity(cx, trip_id, TRIP_CREATED, f"{actor_display_name.strip() or 'کاربر'} سفر «{trip['name']}» را حذف کرد.", actor_display_name)
+            cx.execute("DELETE FROM trips WHERE id=?", (trip_id,))
+            self._mark_mutation()
+
     def delete_item(self, trip_id: int, item_id: int, user_id: int, actor_display_name: str = "کاربر") -> None:
         self.delete_items(trip_id, [item_id], user_id, actor_display_name)
 
@@ -433,10 +490,7 @@ class TripService:
         return rows
 
     def trip_status_history(self, chat_id: int) -> list[tuple[str, str]]:
-        rows = self.db.fetchall(
-            "SELECT name, status FROM trips WHERE chat_id=? ORDER BY id ASC",
-            (chat_id,),
-        )
+        rows = self.trips_for_chat(chat_id)
         history: list[tuple[str, str]] = []
         for row in rows:
             status = str(row["status"])

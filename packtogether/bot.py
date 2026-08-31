@@ -165,7 +165,7 @@ async def touch_local_mutation(context: ContextTypes.DEFAULT_TYPE, reason: str) 
 
 
 async def show(update, service, trip, page=0, main_message=False):
-    trip = service.trip_for_chat(trip["chat_id"])
+    trip = service.trip_by_id(int(trip["id"]))
     items, page, pages = service.page(trip["id"], page)
     text, rows = render_checklist(trip, items, page, pages, *service.progress(trip["id"]))
 
@@ -192,15 +192,20 @@ async def show(update, service, trip, page=0, main_message=False):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     try:
-        await show(update, service, service.trip_for_chat(update.effective_chat.id))
+        trips = service.trips_for_chat(update.effective_chat.id)
+        if len(trips) > 1:
+            await trip_status_command(update, context)
+            return
+        await show(update, service, trips[0])
     except NotFound:
         await update.effective_message.reply_text("سلام 👋\nبرای ساخت چک‌لیست سفر، دستور /newtrip رو داخل گروه بفرست.")
 
 
 async def new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
-    if service.active_trip(update.effective_chat.id):
-        await update.effective_message.reply_text("⚠️ این گروه الان یک سفر فعال داره.\n\nاول همین سفر رو مدیریت کنید یا تا زمان حرکتش صبر کنید.")
+    active_count = len(service.active_trips(update.effective_chat.id))
+    if active_count >= 3:
+        await update.effective_message.reply_text("⚠️ این گروه حداکثر ۳ سفر فعال می‌تواند داشته باشد.\n\nاول یکی از سفرهای فعال را مدیریت کنید یا تا زمان حرکتشان صبر کنید.")
         return
     if not service.begin_setup(update.effective_chat.id, update.effective_user.id):
         await update.effective_message.reply_text("ℹ️ شما همین الان در حال ساخت یک سفر هستید.\nاول همون رو کامل کن یا لغوش کن.")
@@ -219,14 +224,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def trip_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     try:
-        history = service.trip_status_history(update.effective_chat.id)
+        trips = service.trips_for_chat(update.effective_chat.id)
     except NotFound:
-        history = []
-    if not history:
+        trips = []
+    if not trips:
         await update.effective_message.reply_text("هنوز سفری برای این گروه ثبت نشده است.")
         return
-    lines = [f"{name}: {status}" for name, status in history]
-    await update.effective_message.reply_text("\n".join(lines))
+    lines = [f"{trip['name']}: {'هنوز شروع نشده' if trip['status'] == 'packing' else 'شروع و قفل شده'}" for trip in trips]
+    keyboard = []
+    for trip in trips:
+        label = f"{'🟢' if trip['status'] == 'packing' else '🔒'} {trip['name']}"
+        keyboard.append([(label, f"select:{trip['id']}"), ("🚀", f"start:{trip['id']}"), ("🗑️", f"delete_trip:{trip['id']}"), ("✏️", f"edit_trip:{trip['id']}" )])
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=markup(keyboard))
 
 
 async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,7 +280,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response, trip_id = setup_input(service, update.effective_chat.id, update.effective_user.id, update.effective_message.text, actor_display_name=update.effective_user.first_name)
             await update.effective_message.reply_text(response, reply_markup=cancel_markup() if not trip_id else None)
             if trip_id:
-                await show(update, service, service.trip_for_chat(update.effective_chat.id), main_message=True)
+                await show(update, service, service.trip_by_id(trip_id), main_message=True)
                 await touch_local_mutation(context, "setup-complete")
         except (ValueError, TripError, NotFound) as error:
             prompt = DATE_PROMPT if setup["state"] == "date" else TIME_PROMPT if setup["state"] == "time" else None
@@ -280,12 +289,41 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message = f"{message}\n\n{prompt}"
             await update.effective_message.reply_text(message, reply_markup=cancel_markup() if prompt else None)
         return
+    edit_trip = context.user_data.get("edit_trip")
+    if edit_trip:
+        try:
+            trip = service.trip_by_id(int(edit_trip))
+            text = update.effective_message.text.strip()
+            if "|" in text:
+                name_part, time_part = [part.strip() for part in text.split("|", 1)]
+                new_name = name_part or trip["name"]
+                if not time_part:
+                    service.update_trip(trip["id"], new_name, None, update.effective_user.first_name)
+                    context.user_data.pop("edit_trip", None)
+                    await show(update, service, trip)
+                    return
+                if " " in time_part:
+                    date_part, time_part = time_part.split(None, 1)
+                    departure = jalali_to_utc(date_part, time_part, TEHRAN).isoformat()
+                else:
+                    departure = jalali_to_utc(time_part, "14:00", TEHRAN).isoformat()
+                service.update_trip(trip["id"], new_name, departure, update.effective_user.first_name)
+            else:
+                service.update_trip(trip["id"], text or None, None, update.effective_user.first_name)
+            context.user_data.pop("edit_trip", None)
+            await show(update, service, trip)
+            await touch_local_mutation(context, "update-trip")
+        except (TripError, NotFound, ValueError) as error:
+            await update.effective_message.reply_text(str(error))
+        return
+
     add_trip = context.user_data.get("add_item")
     if add_trip:
         try:
-            service.add_items(add_trip, update.effective_message.text.splitlines(), update.effective_user.id, update.effective_user.first_name)
+            trip = service.trip_by_id(int(add_trip))
+            service.add_items(trip["id"], update.effective_message.text.splitlines(), update.effective_user.id, update.effective_user.first_name)
             context.user_data.pop("add_item", None)
-            await show(update, service, service.trip_for_chat(update.effective_chat.id))
+            await show(update, service, trip)
             await touch_local_mutation(context, "add-items")
         except (TripError, NotFound) as error:
             await update.effective_message.reply_text(str(error))
@@ -304,9 +342,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         kind, trip_id, *rest = query.data.split(":")
-        trip = service.trip_for_chat(update.effective_chat.id)
-        if int(trip_id) != trip["id"]:
+        trip = service.trip_by_id(int(trip_id))
+        if trip["chat_id"] != update.effective_chat.id:
             raise NotFound("این چک‌لیست متعلق به این گروه نیست.")
+        context.user_data["selected_trip"] = trip["id"]
 
         if kind == "item":
             item_id = int(rest[0])
@@ -332,8 +371,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await touch_local_mutation(context, "toggle-item")
         elif kind == "add":
             context.user_data["add_item"] = trip["id"]
+            context.user_data["selected_trip"] = trip["id"]
             await query.answer()
-            await query.message.reply_text("➕ آیتم‌ها رو بفرست.\nهر مورد رو در یک خط جدا بنویس ✍️")
+            await query.message.reply_text(f"➕ در سفر «{trip['name']}» آیتم‌ها رو بفرست.\nهر مورد رو در یک خط جدا بنویس ✍️")
         elif kind == "page":
             await query.answer()
             await show(update, service, trip, int(rest[0]))
@@ -375,6 +415,27 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["delete_items"] = []
             await query.answer()
             await render_manage(query, service, trip, context)
+        elif kind == "select":
+            context.user_data["selected_trip"] = trip["id"]
+            await query.answer(f"سفر «{trip['name']}» انتخاب شد.", show_alert=False)
+            await show(update, service, trip, main_message=True)
+        elif kind == "delete_trip":
+            await query.answer()
+            await query.edit_message_text(
+                "🗑️ حذف سفر\n\nاین سفر حذف می‌شود. مطمئن هستی؟",
+                reply_markup=markup([[("✅ بله، حذف کن", f"delete_trip_confirm:{trip['id']}"), ("↩️ لغو", f"cancel:{trip['id']}")]]),
+            )
+        elif kind == "delete_trip_confirm":
+            service.delete_trip(trip["id"], update.effective_user.id, update.effective_user.first_name)
+            await query.answer("🗑️ سفر حذف شد.")
+            await query.message.delete()
+            await trip_status_command(update, context)
+        elif kind == "edit_trip":
+            context.user_data["edit_trip"] = trip["id"]
+            await query.answer()
+            await query.message.reply_text(
+                f"✏️ برای ویرایش سفر «{trip['name']}» نام جدید و/یا تاریخ و ساعت را در یک پیام بفرست.\nمثال: «سفر تبریز | 1405.06.17 14:30»",
+            )
     except Locked:
         await query.answer("🔒 این سفر شروع شده و چک‌لیست قفل است.", show_alert=True)
     except (TripError, ValueError) as error:

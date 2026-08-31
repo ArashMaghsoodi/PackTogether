@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -138,6 +140,27 @@ def test_historical_trip_does_not_block_new_active_trip():
     assert app_service.db.scalar("SELECT COUNT(*) FROM trips WHERE chat_id=?", (-50,)) == 2
 
 
+def test_legacy_past_trip_is_not_treated_as_active_after_migration(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute(
+        "CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, name TEXT NOT NULL, departure_at TEXT NOT NULL, created_by INTEGER NOT NULL, created_at TEXT NOT NULL)"
+    )
+    cur.execute(
+        "INSERT INTO trips(chat_id,name,departure_at,created_by,created_at) VALUES(?,?,?,?,?)",
+        (-80, "مسیر قدیمی", "2020-01-01T00:00:00+00:00", 1, "2020-01-01T00:00:00+00:00"),
+    )
+    con.commit()
+    con.close()
+
+    app_service = service(path)
+    assert app_service.db.scalar("SELECT status FROM trips WHERE chat_id=?", (-80,)) == "locked"
+    assert app_service.active_trip(-80) is None
+    new_trip_id = app_service.create_trip(-80, "جدید", "2099-01-01T00:00:00+00:00", "Asia/Tehran", 2)
+    assert new_trip_id > 0
+
+
 def test_new_sqlite_schema_bootstraps_cleanly(tmp_path):
     path = tmp_path / "fresh.sqlite3"
     app_service = service(path)
@@ -145,7 +168,7 @@ def test_new_sqlite_schema_bootstraps_cleanly(tmp_path):
     assert trip_id > 0
 
 
-def test_concurrent_trip_creation_allows_only_one_active_trip():
+def test_concurrent_trip_creation_allows_up_to_three_active_trips():
     app_service = service()
     departure = "2099-01-01T00:00:00+00:00"
 
@@ -155,7 +178,10 @@ def test_concurrent_trip_creation_allows_only_one_active_trip():
         except Exception:
             return None
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(create, (1, 2)))
-    assert sum(result is not None for result in results) == 1
-    assert app_service.db.scalar("SELECT COUNT(*) FROM trips WHERE chat_id=? AND status='packing'", (-70,)) == 1
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(create, (1, 2, 3)))
+    assert sum(result is not None for result in results) == 3
+    assert app_service.db.scalar("SELECT COUNT(*) FROM trips WHERE chat_id=? AND status='packing'", (-70,)) == 3
+
+    with pytest.raises(Exception):
+        app_service.create_trip(-70, "سفر 4", departure, "Asia/Tehran", 4)
