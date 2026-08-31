@@ -15,6 +15,9 @@ class DummyMessage:
     async def reply_text(self, text, reply_markup=None):
         self.replies.append((text, reply_markup))
 
+    async def edit_text(self, text, reply_markup=None):
+        self.replies.append((text, reply_markup))
+
 
 class DummyQuery:
     def __init__(self, data: str):
@@ -36,6 +39,12 @@ class ServiceStub:
 
     def trip_by_id(self, trip_id: int):
         return {"id": trip_id, "chat_id": self.chat_id, "name": "سفر تست", "status": "packing"}
+
+    def trips_for_chat(self, chat_id: int):
+        return [
+            {"id": 1, "name": "سفر تست", "status": "packing", "chat_id": chat_id},
+            {"id": 2, "name": "سفر دوم", "status": "locked", "chat_id": chat_id},
+        ]
 
 
 class BrokenServiceStub(ServiceStub):
@@ -68,11 +77,6 @@ def test_cancel_start_has_context_specific_text():
     assert query.edits[-1][0] == "↩️ شروع فوری سفر لغو شد."
 
 
-def test_cancel_delete_trip_has_context_specific_text():
-    query = DummyQuery("cancel_delete_trip:1")
-    asyncio.run(callback(_update(query), _context(ServiceStub())))
-    assert query.edits
-    assert query.edits[-1][0] == "↩️ حذف سفر لغو شد."
 
 
 def test_callback_unknown_failure_returns_alert():
@@ -81,3 +85,14 @@ def test_callback_unknown_failure_returns_alert():
     assert query.answers
     assert query.answers[-1]["show_alert"] is True
     assert "خطایی رخ داد" in (query.answers[-1]["text"] or "")
+
+
+def test_cancel_delete_trip_reopens_status_menu_message():
+    query = DummyQuery("cancel_delete_trip:1")
+    update = _update(query)
+    update.effective_message = query.message
+    asyncio.run(callback(update, _context(ServiceStub())))
+    assert query.message.deleted is True
+    assert query.message.replies
+    status_text = query.message.replies[-1][0]
+    assert "سفر تست" in status_text

@@ -43,6 +43,18 @@ def cancel_markup():
 
 DATE_PROMPT = "📅 تاریخ حرکت سفر رو بفرست.\n\nمثال:\n1405.06.17"
 TIME_PROMPT = "🕐 ساعت حرکت رو بفرست.\n\nمثال:\n14:30"
+EDIT_TRIP_PROMPT = "✏️ برای ویرایش سفر، پیام را دقیقاً در ۳ خط بفرست:\n\nسفر تبریز\n1405.06.17\n14:30"
+
+
+def parse_trip_edit_message(text: str) -> tuple[str, str]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 3:
+        raise ValueError(f"❌ فرمت ویرایش نادرست است.\n\n{EDIT_TRIP_PROMPT}")
+    name, date_part, time_part = lines
+    if not name or len(name) > 80:
+        raise ValueError("❌ نام سفر باید بین ۱ تا ۸۰ نویسه باشد.")
+    departure = jalali_to_utc(date_part, time_part, TEHRAN).isoformat()
+    return name, departure
 
 
 def _sync_log_level() -> str:
@@ -293,24 +305,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if edit_trip:
         try:
             trip = service.trip_by_id(int(edit_trip))
-            text = update.effective_message.text.strip()
-            if "|" in text:
-                name_part, time_part = [part.strip() for part in text.split("|", 1)]
-                new_name = name_part or trip["name"]
-                if not time_part:
-                    service.update_trip(trip["id"], new_name, None, update.effective_user.first_name)
-                    context.user_data.pop("edit_trip", None)
-                    await show(update, service, trip)
-                    return
-                if " " in time_part:
-                    date_part, time_part = time_part.split(None, 1)
-                    departure = jalali_to_utc(date_part, time_part, TEHRAN).isoformat()
-                else:
-                    departure = jalali_to_utc(time_part, "14:00", TEHRAN).isoformat()
-                service.update_trip(trip["id"], new_name, departure, update.effective_user.first_name)
-            else:
-                service.update_trip(trip["id"], text or None, None, update.effective_user.first_name)
+            new_name, departure = parse_trip_edit_message(update.effective_message.text)
+            service.update_trip(trip["id"], new_name, departure, update.effective_user.first_name)
             context.user_data.pop("edit_trip", None)
+            await update.effective_message.reply_text(f"✅ سفر «{new_name}» با موفقیت ویرایش شد.")
             await show(update, service, trip)
             await touch_local_mutation(context, "update-trip")
         except (TripError, NotFound, ValueError) as error:
@@ -402,7 +400,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("↩️ شروع فوری سفر لغو شد.")
         elif kind == "cancel_delete_trip":
             await query.answer()
-            await query.edit_message_text("↩️ حذف سفر لغو شد.")
+            await query.message.delete()
+            await trip_status_command(update, context)
         elif kind == "start":
             await query.answer()
             await query.edit_message_text(
@@ -443,9 +442,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif kind == "edit_trip":
             context.user_data["edit_trip"] = trip["id"]
             await query.answer()
-            await query.message.reply_text(
-                f"✏️ برای ویرایش سفر «{trip['name']}» نام جدید و/یا تاریخ و ساعت را در یک پیام بفرست.\nمثال: «سفر تبریز | 1405.06.17 14:30»",
-            )
+            await query.message.reply_text(f"✏️ برای ویرایش سفر «{trip['name']}» پیام را دقیقاً در ۳ خط بفرست:\n\nسفر تبریز\n1405.06.17\n14:30")
     except Locked:
         await query.answer("🔒 این سفر شروع شده و چک‌لیست قفل است.", show_alert=True)
     except (TripError, ValueError) as error:
