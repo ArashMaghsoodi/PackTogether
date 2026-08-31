@@ -216,6 +216,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("راهنما ✨\nبرای ساخت چک‌لیست، داخل گروه دستور /newtrip رو بفرست.")
 
 
+async def trip_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data["service"]
+    try:
+        history = service.trip_status_history(update.effective_chat.id)
+    except NotFound:
+        history = []
+    if not history:
+        await update.effective_message.reply_text("هنوز سفری برای این گروه ثبت نشده است.")
+        return
+    lines = [f"{name}: {status}" for name, status in history]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.application.bot_data["service"]
     if service.cancel_setup(update.effective_chat.id, update.effective_user.id):
@@ -423,6 +436,7 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", trip_status_command, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("newtrip", new_trip, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("newtrip", private_new_trip, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(callback))
@@ -439,7 +453,7 @@ async def set_command_menus(application: Application) -> None:
         scope=BotCommandScopeAllPrivateChats(),
     )
     await application.bot.set_my_commands(
-        [BotCommand("start", "نمایش چک‌لیست"), BotCommand("help", "راهنما"), BotCommand("newtrip", "ساخت سفر جدید")],
+        [BotCommand("start", "نمایش چک‌لیست"), BotCommand("help", "راهنما"), BotCommand("status", "وضعیت سفرها"), BotCommand("newtrip", "ساخت سفر جدید")],
         scope=BotCommandScopeAllGroupChats(),
     )
 

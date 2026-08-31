@@ -431,3 +431,15 @@ class TripService:
             item_id = row.get("item_id")
             row["item_name"] = item_names_by_id.get(int(item_id)) if item_id is not None else None
         return rows
+
+    def trip_status_history(self, chat_id: int) -> list[tuple[str, str]]:
+        rows = self.db.fetchall(
+            "SELECT name, status FROM trips WHERE chat_id=? ORDER BY id ASC",
+            (chat_id,),
+        )
+        history: list[tuple[str, str]] = []
+        for row in rows:
+            status = str(row["status"])
+            label = "شروع و قفل شده" if status == "locked" else "هنوز شروع نشده"
+            history.append((str(row["name"]), label))
+        return history

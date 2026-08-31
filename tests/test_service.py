@@ -110,3 +110,18 @@ def test_start_trip_locks_immediately_and_records_actor():
     assert (event["action"], event["actor_name"]) == ("trip_locked", "سارا")
     with pytest.raises(Locked):
         s.add_item(t, "چادر", 1)
+
+
+def test_trip_status_history_lists_each_trip_with_status_label():
+    s = service(); now = datetime.now(timezone.utc)
+    t1 = s.db.insert_returning_id(
+        "INSERT INTO trips(chat_id,name,departure_at,status,created_by,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+        (-200, "سفر شمال", (now + timedelta(days=1)).isoformat(), "locked", 1, now.isoformat()),
+    )
+    t2 = s.db.insert_returning_id(
+        "INSERT INTO trips(chat_id,name,departure_at,status,created_by,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+        (-200, "سفر تبریز", (now + timedelta(days=2)).isoformat(), "packing", 1, now.isoformat()),
+    )
+    history = s.trip_status_history(-200)
+    assert [line for line, _ in history] == ["سفر شمال", "سفر تبریز"]
+    assert [status for _, status in history] == ["شروع و قفل شده", "هنوز شروع نشده"]
