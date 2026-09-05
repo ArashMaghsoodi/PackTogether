@@ -229,6 +229,41 @@ async def private_new_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("⚠️ برای ساخت سفر باید /newtrip رو داخل گروهی بفرستی که PackTogether اونجاست.")
 
 
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dev_id = _dev_id()
+    if dev_id is None or update.effective_user.id != dev_id:
+        return
+
+    service = context.application.bot_data.get("service")
+    mirror = context.application.bot_data.get("mirror")
+
+    if not service or mirror is None:
+        await update.effective_message.reply_text("❌ سرویس همگام‌سازی یا دیتابیس Supabase تنظیم نشده است.")
+        return
+
+    await update.effective_message.reply_text("🔄 همگام‌سازی دستی با Supabase شروع شد...")
+    started = datetime.now(timezone.utc)
+    try:
+        result = service.sync_to_mirror(mirror)
+        elapsed = int((datetime.now(timezone.utc) - started).total_seconds())
+        counts = result.get("counts", {})
+        if result.get("synced"):
+            msg = (
+                f"✅ همگام‌سازی با موفقیت انجام شد ({elapsed} ثانیه).\n\n"
+                f"📊 آمار:\n"
+                f"- سفرها: {counts.get('trips', 0)}\n"
+                f"- آیتم‌ها: {counts.get('items', 0)}\n"
+                f"- تاریخچه فعالیت‌ها: {counts.get('actions', 0)}\n"
+                f"- وضعیت پاکسازی تغییرات محلی: {result.get('cleared')}"
+            )
+        else:
+            msg = f"ℹ️ نیازی به همگام‌سازی نبود (داده‌ها به‌روز هستند).\nعلت: {result.get('reason')}"
+        await update.effective_message.reply_text(msg)
+    except Exception as error:
+        log.exception("manual mirror sync failed")
+        await update.effective_message.reply_text(f"❌ همگام‌سازی ناموفق بود:\n{error}")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("راهنما ✨\nبرای ساخت چک‌لیست، داخل گروه دستور /newtrip رو بفرست.")
 
@@ -508,6 +543,7 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("sync", sync_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("status", trip_status_command, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("newtrip", new_trip, filters=filters.ChatType.GROUPS))
     application.add_handler(CommandHandler("newtrip", private_new_trip, filters=filters.ChatType.PRIVATE))

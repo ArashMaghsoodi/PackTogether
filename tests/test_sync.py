@@ -76,6 +76,50 @@ def test_sync_to_mirror_excludes_expired_actions():
     assert sent_actions == []
 
 
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_sync_command_unauthorized(monkeypatch):
+    from packtogether.bot import sync_command
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("DEV_ID", "12345")
+    update = MagicMock()
+    update.effective_user.id = 99999
+    update.effective_message.reply_text = AsyncMock()
+    context = MagicMock()
+
+    await sync_command(update, context)
+    update.effective_message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sync_command_authorized(monkeypatch):
+    from packtogether.bot import sync_command
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("DEV_ID", "12345")
+    update = MagicMock()
+    update.effective_user.id = 12345
+    update.effective_message.reply_text = AsyncMock()
+
+    service = MagicMock()
+    service.sync_to_mirror.return_value = {
+        "synced": True,
+        "counts": {"trips": 1, "items": 2, "actions": 3},
+        "cleared": True,
+    }
+    mirror = MagicMock()
+
+    context = MagicMock()
+    context.application.bot_data = {"service": service, "mirror": mirror}
+
+    await sync_command(update, context)
+    assert update.effective_message.reply_text.call_count == 2
+
+
+
 def test_legacy_items_position_column_is_migrated(tmp_path):
     db_path = tmp_path / "legacy.sqlite3"
     conn = sqlite3.connect(db_path)
